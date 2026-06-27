@@ -20,30 +20,33 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API with Base64 is running"
+        "message": "Storyboard Splitter API - Expanded Crop for AI Outpaint"
     }
 
 
-def fallback_grid(img, rows, cols):
+def make_grid_boxes(img, rows, cols):
     h, w = img.shape[:2]
     boxes = []
 
-    cell_w = w // cols
-    cell_h = h // rows
+    cell_w = w / cols
+    cell_h = h / rows
 
     for r in range(rows):
         for c in range(cols):
-            x1 = c * cell_w + 4
-            y1 = r * cell_h + 4
-            x2 = (c + 1) * cell_w - 4 if c < cols - 1 else w - 4
-            y2 = (r + 1) * cell_h - 4 if r < rows - 1 else h - 4
+            x1 = int(round(c * cell_w))
+            y1 = int(round(r * cell_h))
+            x2 = int(round((c + 1) * cell_w))
+            y2 = int(round((r + 1) * cell_h))
 
-            boxes.append((
-                max(0, int(x1)),
-                max(0, int(y1)),
-                min(w, int(x2)),
-                min(h, int(y2))
-            ))
+            # bỏ viền trắng rất nhẹ
+            margin = 3
+
+            boxes.append({
+                "x1": max(0, x1 + margin),
+                "y1": max(0, y1 + margin),
+                "x2": min(w, x2 - margin),
+                "y2": min(h, y2 - margin)
+            })
 
     return boxes
 
@@ -56,12 +59,12 @@ def border_score(img, rows, cols):
 
     for c in range(1, cols):
         x = int(w * c / cols)
-        band = gray[:, max(0, x - 4):min(w, x + 4)]
+        band = gray[:, max(0, x - 5):min(w, x + 5)]
         scores.append(float(np.mean(band > 225)))
 
     for r in range(1, rows):
         y = int(h * r / rows)
-        band = gray[max(0, y - 4):min(h, y + 4), :]
+        band = gray[max(0, y - 5):min(h, y + 5), :]
         scores.append(float(np.mean(band > 225)))
 
     return float(np.mean(scores)) if scores else 0.0
@@ -92,11 +95,44 @@ def choose_auto_layout(img):
     return best
 
 
-def detect_layout(img, rows=0, cols=0):
+def detect_layout(img, rows, cols):
     if rows > 0 and cols > 0:
         return rows, cols
 
     return choose_auto_layout(img)
+
+
+def expand_box(box, img_w, img_h, padding_percent):
+    x1 = box["x1"]
+    y1 = box["y1"]
+    x2 = box["x2"]
+    y2 = box["y2"]
+
+    bw = x2 - x1
+    bh = y2 - y1
+
+    pad_x = int(bw * padding_percent)
+    pad_y = int(bh * padding_percent)
+
+    return {
+        "x1": max(0, x1 - pad_x),
+        "y1": max(0, y1 - pad_y),
+        "x2": min(img_w, x2 + pad_x),
+        "y2": min(img_h, y2 + pad_y)
+    }
+
+
+def encode_jpg_base64(img, quality):
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        img,
+        [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
+    )
+
+    if not ok:
+        return None
+
+    return base64.b64encode(buffer).decode("utf-8")
 
 
 @app.post("/split-storyboard")
@@ -104,6 +140,7 @@ async def split_storyboard(
     file: UploadFile = File(...),
     rows: int = Query(0),
     cols: int = Query(0),
+    padding: float = Query(0.20),
     quality: int = Query(96)
 ):
     try:
@@ -118,39 +155,44 @@ async def split_storyboard(
                 status_code=400
             )
 
+        img_h, img_w = img.shape[:2]
+
         final_rows, final_cols = detect_layout(img, rows, cols)
-        boxes = fallback_grid(img, final_rows, final_cols)
+        original_boxes = make_grid_boxes(img, final_rows, final_cols)
 
         batch_id = str(uuid.uuid4())[:8]
         scenes = []
 
-        for i, (x1, y1, x2, y2) in enumerate(boxes, start=1):
-            frame = img[y1:y2, x1:x2]
+        for i, storyboard_box in enumerate(original_boxes, start=1):
+            crop_box = expand_box(
+                storyboard_box,
+                img_w,
+                img_h,
+                padding
+            )
 
-            if frame.size == 0:
+            x1 = crop_box["x1"]
+            y1 = crop_box["y1"]
+            x2 = crop_box["x2"]
+            y2 = crop_box["y2"]
+
+            crop = img[y1:y2, x1:x2]
+
+            if crop.size == 0:
                 continue
 
-            filename = f"{batch_id}_scene_{i:03}.jpg"
+            filename = f"{batch_id}_scene_{i:03}_expanded.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
 
             cv2.imwrite(
                 path,
-                frame,
+                crop,
                 [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
             )
 
-            ok, buffer = cv2.imencode(
-                ".jpg",
-                frame,
-                [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
-            )
+            image_base64 = encode_jpg_base64(crop, quality)
 
-            image_base64 = (
-                base64.b64encode(buffer).decode("utf-8")
-                if ok else None
-            )
-
-            h, w = frame.shape[:2]
+            h, w = crop.shape[:2]
 
             scenes.append({
                 "scene": int(i),
@@ -164,12 +206,9 @@ async def split_storyboard(
                     "rows": int(final_rows),
                     "cols": int(final_cols)
                 },
-                "storyboard_box": {
-                    "x1": int(x1),
-                    "y1": int(y1),
-                    "x2": int(x2),
-                    "y2": int(y2)
-                }
+                "storyboard_box": storyboard_box,
+                "crop_box": crop_box,
+                "padding": float(padding)
             })
 
         return {
@@ -178,6 +217,8 @@ async def split_storyboard(
                 "rows": int(final_rows),
                 "cols": int(final_cols)
             },
+            "padding": float(padding),
+            "quality": int(quality),
             "scenes": scenes
         }
 
