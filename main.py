@@ -20,7 +20,7 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API - Expanded Crop for AI Outpaint"
+        "message": "Storyboard Splitter No AI - Keep Original"
     }
 
 
@@ -33,96 +33,56 @@ def make_grid_boxes(img, rows, cols):
 
     for r in range(rows):
         for c in range(cols):
-            x1 = int(round(c * cell_w))
-            y1 = int(round(r * cell_h))
-            x2 = int(round((c + 1) * cell_w))
-            y2 = int(round((r + 1) * cell_h))
-
-            # bỏ viền trắng rất nhẹ
-            margin = 3
+            x1 = int(round(c * cell_w)) + 3
+            y1 = int(round(r * cell_h)) + 3
+            x2 = int(round((c + 1) * cell_w)) - 3
+            y2 = int(round((r + 1) * cell_h)) - 3
 
             boxes.append({
-                "x1": max(0, x1 + margin),
-                "y1": max(0, y1 + margin),
-                "x2": min(w, x2 - margin),
-                "y2": min(h, y2 - margin)
+                "x1": max(0, x1),
+                "y1": max(0, y1),
+                "x2": min(w, x2),
+                "y2": min(h, y2)
             })
 
     return boxes
 
 
-def border_score(img, rows, cols):
+def make_9x16_no_ai(img, width=1080, height=1920, bg="black"):
     h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    scores = []
+    scale = min(width / w, height / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
 
-    for c in range(1, cols):
-        x = int(w * c / cols)
-        band = gray[:, max(0, x - 5):min(w, x + 5)]
-        scores.append(float(np.mean(band > 225)))
+    resized = cv2.resize(
+        img,
+        (new_w, new_h),
+        interpolation=cv2.INTER_LANCZOS4
+    )
 
-    for r in range(1, rows):
-        y = int(h * r / rows)
-        band = gray[max(0, y - 5):min(h, y + 5), :]
-        scores.append(float(np.mean(band > 225)))
+    if bg == "white":
+        canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
+    elif bg == "average":
+        avg_color = np.mean(img.reshape(-1, 3), axis=0).astype(np.uint8)
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        canvas[:] = avg_color
+    else:
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
 
-    return float(np.mean(scores)) if scores else 0.0
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
 
+    canvas[y:y + new_h, x:x + new_w] = resized
 
-def choose_auto_layout(img):
-    candidates = [
-        (4, 2),
-        (3, 2),
-        (3, 3),
-        (4, 3),
-        (5, 2),
-        (2, 2),
-        (2, 3),
-        (5, 3),
-    ]
+    # sharpen nhẹ, không vẽ thêm
+    blur = cv2.GaussianBlur(canvas, (0, 0), 1.0)
+    sharp = cv2.addWeighted(canvas, 1.25, blur, -0.25, 0)
 
-    best = (4, 2)
-    best_score = -999
-
-    for rows, cols in candidates:
-        score = border_score(img, rows, cols)
-
-        if score > best_score:
-            best_score = score
-            best = (rows, cols)
-
-    return best
+    return sharp
 
 
-def detect_layout(img, rows, cols):
-    if rows > 0 and cols > 0:
-        return rows, cols
-
-    return choose_auto_layout(img)
-
-
-def expand_box(box, img_w, img_h, padding_percent):
-    x1 = box["x1"]
-    y1 = box["y1"]
-    x2 = box["x2"]
-    y2 = box["y2"]
-
-    bw = x2 - x1
-    bh = y2 - y1
-
-    pad_x = int(bw * padding_percent)
-    pad_y = int(bh * padding_percent)
-
-    return {
-        "x1": max(0, x1 - pad_x),
-        "y1": max(0, y1 - pad_y),
-        "x2": min(img_w, x2 + pad_x),
-        "y2": min(img_h, y2 + pad_y)
-    }
-
-
-def encode_jpg_base64(img, quality):
+def encode_base64(img, quality=96):
     ok, buffer = cv2.imencode(
         ".jpg",
         img,
@@ -138,14 +98,15 @@ def encode_jpg_base64(img, quality):
 @app.post("/split-storyboard")
 async def split_storyboard(
     file: UploadFile = File(...),
-    rows: int = Query(0),
-    cols: int = Query(0),
-    padding: float = Query(0.20),
+    rows: int = Query(4),
+    cols: int = Query(2),
+    width: int = Query(1080),
+    height: int = Query(1920),
+    bg: str = Query("black"),
     quality: int = Query(96)
 ):
     try:
         contents = await file.read()
-
         arr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
@@ -155,70 +116,58 @@ async def split_storyboard(
                 status_code=400
             )
 
-        img_h, img_w = img.shape[:2]
-
-        final_rows, final_cols = detect_layout(img, rows, cols)
-        original_boxes = make_grid_boxes(img, final_rows, final_cols)
-
+        boxes = make_grid_boxes(img, rows, cols)
         batch_id = str(uuid.uuid4())[:8]
+
         scenes = []
 
-        for i, storyboard_box in enumerate(original_boxes, start=1):
-            crop_box = expand_box(
-                storyboard_box,
-                img_w,
-                img_h,
-                padding
-            )
-
-            x1 = crop_box["x1"]
-            y1 = crop_box["y1"]
-            x2 = crop_box["x2"]
-            y2 = crop_box["y2"]
+        for i, box in enumerate(boxes, start=1):
+            x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
 
             crop = img[y1:y2, x1:x2]
 
             if crop.size == 0:
                 continue
 
-            filename = f"{batch_id}_scene_{i:03}_expanded.jpg"
+            final_img = make_9x16_no_ai(
+                crop,
+                width=width,
+                height=height,
+                bg=bg
+            )
+
+            filename = f"{batch_id}_scene_{i:03}_9x16_no_ai.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
 
             cv2.imwrite(
                 path,
-                crop,
+                final_img,
                 [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
             )
 
-            image_base64 = encode_jpg_base64(crop, quality)
-
-            h, w = crop.shape[:2]
+            image_base64 = encode_base64(final_img, quality)
 
             scenes.append({
                 "scene": int(i),
                 "fileName": filename,
                 "mimeType": "image/jpeg",
-                "width": int(w),
-                "height": int(h),
+                "width": int(width),
+                "height": int(height),
+                "ratio": "9:16",
                 "url": f"{BASE_URL}/files/{filename}",
                 "base64": image_base64,
-                "layout": {
-                    "rows": int(final_rows),
-                    "cols": int(final_cols)
-                },
-                "storyboard_box": storyboard_box,
-                "crop_box": crop_box,
-                "padding": float(padding)
+                "storyboard_box": box
             })
 
         return {
             "total": len(scenes),
-            "layout": {
-                "rows": int(final_rows),
-                "cols": int(final_cols)
-            },
-            "padding": float(padding),
-            "quality": int(quality),
+            "rows": int(rows),
+            "cols": int(cols),
+            "width": int(width),
+            "height": int(height),
+            "ratio": "9:16",
+            "background": bg,
+            "ai": "disabled",
             "scenes": scenes
         }
 
