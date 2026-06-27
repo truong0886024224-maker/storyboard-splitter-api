@@ -20,7 +20,7 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API Pro is running"
+        "message": "Storyboard Splitter API Pro Sharp is running"
     }
 
 
@@ -46,7 +46,6 @@ def find_white_separators(img):
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Detect near-white gutters
     vertical_score = np.mean(gray > 235, axis=0)
     horizontal_score = np.mean(gray > 235, axis=1)
 
@@ -118,10 +117,10 @@ def fallback_grid(img, rows=4, cols=3):
 
             margin = 4
             boxes.append((
-                x1 + margin,
-                y1 + margin,
-                x2 - margin,
-                y2 - margin
+                max(0, x1 + margin),
+                max(0, y1 + margin),
+                min(w, x2 - margin),
+                min(h, y2 - margin)
             ))
 
     return boxes
@@ -134,20 +133,16 @@ def detect_storyboard_boxes(img, rows=0, cols=0):
     v_lines, h_lines = find_white_separators(img)
     boxes = boxes_from_lines(img, v_lines, h_lines)
 
-    # If auto detection fails, fallback to common layouts
     if len(boxes) < 4:
         h, w = img.shape[:2]
         ratio = w / h
 
-        # Tall storyboard usually 3 cols x 4 rows
         if ratio < 0.8:
             boxes = fallback_grid(img, 4, 3)
         else:
             boxes = fallback_grid(img, 4, 2)
 
-    # Sort top-to-bottom, left-to-right
     boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-
     return boxes
 
 
@@ -157,13 +152,10 @@ def crop_to_9x16(img):
     current_ratio = w / h
 
     if current_ratio > target_ratio:
-        # Too wide, crop left/right
         new_w = int(h * target_ratio)
         x1 = max(0, (w - new_w) // 2)
         return img[:, x1:x1 + new_w]
-
     else:
-        # Too tall, crop top/bottom
         new_h = int(w / target_ratio)
         y1 = max(0, (h - new_h) // 2)
         return img[y1:y1 + new_h, :]
@@ -172,25 +164,60 @@ def crop_to_9x16(img):
 def resize_and_sharpen(img, width=1080, height=1920):
     img = crop_to_9x16(img)
 
+    h, w = img.shape[:2]
+
+    # Upscale nhiều bước để đỡ vỡ hơn
+    if w < width or h < height:
+        scale1 = cv2.resize(
+            img,
+            (w * 2, h * 2),
+            interpolation=cv2.INTER_CUBIC
+        )
+    else:
+        scale1 = img
+
     resized = cv2.resize(
-        img,
+        scale1,
         (width, height),
         interpolation=cv2.INTER_LANCZOS4
     )
 
-    # Gentle contrast
-    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
+    # Denoise nhẹ
+    denoise = cv2.fastNlMeansDenoisingColored(
+        resized,
+        None,
+        3,
+        3,
+        7,
+        21
+    )
+
+    # Tăng contrast nhẹ bằng CLAHE
+    lab = cv2.cvtColor(denoise, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
-    clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+
     l = clahe.apply(l)
 
     enhanced = cv2.merge((l, a, b))
     enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
-    # Gentle sharpening
-    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.1)
-    sharp = cv2.addWeighted(enhanced, 1.28, blur, -0.28, 0)
+    # Sharpen mạnh hơn
+    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+    sharp = cv2.addWeighted(enhanced, 1.65, blur, -0.65, 0)
+
+    # Làm nét cạnh nhẹ
+    kernel = np.array([
+        [0, -0.15, 0],
+        [-0.15, 1.6, -0.15],
+        [0, -0.15, 0]
+    ])
+
+    sharp = cv2.filter2D(sharp, -1, kernel)
 
     return sharp
 
@@ -230,12 +257,12 @@ async def split_storyboard(
         filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
         path = os.path.join(OUTPUT_DIR, filename)
 
-        cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 96])
+        cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 98])
 
         ok, buffer = cv2.imencode(
             ".jpg",
             final_img,
-            [cv2.IMWRITE_JPEG_QUALITY, 96]
+            [cv2.IMWRITE_JPEG_QUALITY, 98]
         )
 
         scenes.append({
