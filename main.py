@@ -19,13 +19,14 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API Auto Layout Pro is running"
+        "message": "Storyboard Splitter API Keep Original is running"
     }
 
 
 def fallback_grid(img, rows, cols):
     h, w = img.shape[:2]
     boxes = []
+
     cell_w = w // cols
     cell_h = h // rows
 
@@ -71,14 +72,14 @@ def choose_auto_layout(img):
     ratio = w / h
 
     candidates = [
-        (4, 2),   # 8 ảnh dọc
-        (3, 2),   # 6 ảnh
-        (3, 3),   # 9 ảnh
-        (4, 3),   # 12 ảnh
-        (5, 2),   # 10 ảnh
-        (2, 2),   # 4 ảnh
-        (2, 3),   # 6 ảnh ngang
-        (5, 3),   # 15 ảnh
+        (4, 2),
+        (3, 2),
+        (3, 3),
+        (4, 3),
+        (5, 2),
+        (2, 2),
+        (2, 3),
+        (5, 3),
     ]
 
     best = None
@@ -90,7 +91,6 @@ def choose_auto_layout(img):
         expected_ratio = cols / rows
         ratio_penalty = abs(ratio - expected_ratio) * 0.25
 
-        # Ưu tiên layout phổ biến dọc
         common_bonus = 0
         if (rows, cols) in [(4, 2), (4, 3), (3, 3), (3, 2)]:
             common_bonus = 0.08
@@ -111,140 +111,42 @@ def detect_layout(img, rows=0, cols=0):
     return choose_auto_layout(img)
 
 
-def detect_face_center(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    face_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(face_path)
-
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=4,
-        minSize=(30, 30)
-    )
-
-    if len(faces) == 0:
-        return None
-
-    x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-
-    return {
-        "cx": int(x + fw // 2),
-        "cy": int(y + fh // 2),
-        "box": {
-            "x": int(x),
-            "y": int(y),
-            "w": int(fw),
-            "h": int(fh)
-        }
-    }
-
-
-def detect_subject_center_by_edges(img):
+def resize_keep_original(img, width=1080, height=1920, bg_mode="black"):
     h, w = img.shape[:2]
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-
-    kernel = np.ones((7, 7), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(
-        edges,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    valid = []
-
-    for cnt in contours:
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        area = cw * ch
-
-        if area < (w * h) * 0.03:
-            continue
-        if cw < w * 0.1 or ch < h * 0.1:
-            continue
-
-        valid.append((x, y, cw, ch, area))
-
-    if not valid:
-        return int(w // 2), int(h // 2)
-
-    x, y, cw, ch, _ = max(valid, key=lambda b: b[4])
-
-    return int(x + cw // 2), int(y + ch // 2)
-
-
-def smart_subject_center(img):
-    h, w = img.shape[:2]
-
-    face = detect_face_center(img)
-
-    if face:
-        cx = face["cx"]
-        cy = int(face["cy"] + h * 0.15)
-        return cx, cy, "face", face["box"]
-
-    cx, cy = detect_subject_center_by_edges(img)
-    return int(cx), int(cy), "edge", None
-
-
-def crop_9x16_around_center(img, center_x, center_y):
-    h, w = img.shape[:2]
-    target_ratio = 9 / 16
-
-    crop_w = w
-    crop_h = int(crop_w / target_ratio)
-
-    if crop_h > h:
-        crop_h = h
-        crop_w = int(crop_h * target_ratio)
-
-    x1 = int(center_x - crop_w / 2)
-    y1 = int(center_y - crop_h / 2)
-
-    x1 = max(0, min(x1, w - crop_w))
-    y1 = max(0, min(y1, h - crop_h))
-
-    x2 = x1 + crop_w
-    y2 = y1 + crop_h
-
-    cropped = img[y1:y2, x1:x2]
-
-    return cropped, {
-        "x1": int(x1),
-        "y1": int(y1),
-        "x2": int(x2),
-        "y2": int(y2)
-    }
-
-
-def resize_and_sharpen(img, width=1080, height=1920):
-    cx, cy, method, face_box = smart_subject_center(img)
-
-    cropped, crop_box = crop_9x16_around_center(img, cx, cy)
-
-    if cropped.size == 0:
-        cropped = img
+    scale = min(width / w, height / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
 
     resized = cv2.resize(
-        cropped,
-        (width, height),
+        img,
+        (new_w, new_h),
         interpolation=cv2.INTER_LANCZOS4
     )
 
-    blur = cv2.GaussianBlur(resized, (0, 0), 1.0)
-    sharp = cv2.addWeighted(resized, 1.4, blur, -0.4, 0)
+    if bg_mode == "blur":
+        bg = cv2.resize(img, (width, height), interpolation=cv2.INTER_CUBIC)
+        canvas = cv2.GaussianBlur(bg, (0, 0), 30)
+    else:
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
+
+    canvas[y:y + new_h, x:x + new_w] = resized
+
+    blur = cv2.GaussianBlur(canvas, (0, 0), 1.0)
+    sharp = cv2.addWeighted(canvas, 1.25, blur, -0.25, 0)
 
     debug = {
-        "center_x": int(cx),
-        "center_y": int(cy),
-        "method": method,
-        "face_box": face_box,
-        "crop_9x16_box": crop_box
+        "mode": "keep_original_no_crop",
+        "background": bg_mode,
+        "original_width": int(w),
+        "original_height": int(h),
+        "new_width": int(new_w),
+        "new_height": int(new_h),
+        "x": int(x),
+        "y": int(y)
     }
 
     return sharp, debug
@@ -256,7 +158,8 @@ async def split_storyboard(
     rows: int = Query(0),
     cols: int = Query(0),
     width: int = Query(1080),
-    height: int = Query(1920)
+    height: int = Query(1920),
+    bg: str = Query("black")
 ):
     try:
         contents = await file.read()
@@ -282,9 +185,9 @@ async def split_storyboard(
             if frame.size == 0:
                 continue
 
-            final_img, debug = resize_and_sharpen(frame, width, height)
+            final_img, debug = resize_keep_original(frame, width, height, bg)
 
-            filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
+            filename = f"{batch_id}_scene_{i:03}_keep_{width}x{height}.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
 
             cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 96])
@@ -307,7 +210,7 @@ async def split_storyboard(
                     "x2": int(x2),
                     "y2": int(y2)
                 },
-                "smart_crop": debug
+                "resize": debug
             })
 
         return {
@@ -319,6 +222,7 @@ async def split_storyboard(
             "width": int(width),
             "height": int(height),
             "ratio": "9:16",
+            "background": bg,
             "scenes": scenes
         }
 
