@@ -19,7 +19,7 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API Smart Crop is running"
+        "message": "Storyboard Splitter API Smart Crop Fixed is running"
     }
 
 
@@ -28,10 +28,11 @@ def group_indices(indices, max_gap=5):
         return []
 
     groups = []
-    start = indices[0]
-    prev = indices[0]
+    start = int(indices[0])
+    prev = int(indices[0])
 
     for idx in indices[1:]:
+        idx = int(idx)
         if idx - prev > max_gap:
             groups.append((start, prev))
             start = idx
@@ -60,12 +61,12 @@ def find_white_separators(img):
     for a, b in v_groups:
         thickness = b - a + 1
         if 2 <= thickness <= w * 0.06:
-            v_lines.append((a + b) // 2)
+            v_lines.append(int((a + b) // 2))
 
     for a, b in h_groups:
         thickness = b - a + 1
         if 2 <= thickness <= h * 0.06:
-            h_lines.append((a + b) // 2)
+            h_lines.append(int((a + b) // 2))
 
     return v_lines, h_lines
 
@@ -90,11 +91,12 @@ def boxes_from_lines(img, v_lines, h_lines):
                 continue
 
             margin = 3
+
             boxes.append((
-                max(0, x1 + margin),
-                max(0, y1 + margin),
-                min(w, x2 - margin),
-                min(h, y2 - margin)
+                int(max(0, x1 + margin)),
+                int(max(0, y1 + margin)),
+                int(min(w, x2 - margin)),
+                int(min(h, y2 - margin))
             ))
 
     return boxes
@@ -115,11 +117,12 @@ def fallback_grid(img, rows=4, cols=3):
             y2 = (r + 1) * cell_h if r < rows - 1 else h
 
             margin = 4
+
             boxes.append((
-                max(0, x1 + margin),
-                max(0, y1 + margin),
-                min(w, x2 - margin),
-                min(h, y2 - margin)
+                int(max(0, x1 + margin)),
+                int(max(0, y1 + margin)),
+                int(min(w, x2 - margin)),
+                int(min(h, y2 - margin))
             ))
 
     return boxes
@@ -160,13 +163,19 @@ def detect_face_center(img):
     if len(faces) == 0:
         return None
 
-    # lấy mặt lớn nhất
-    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+    x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
 
-    cx = x + w // 2
-    cy = y + h // 2
+    cx = int(x + fw // 2)
+    cy = int(y + fh // 2)
 
-    return cx, cy, (x, y, w, h)
+    face_box = {
+        "x": int(x),
+        "y": int(y),
+        "w": int(fw),
+        "h": int(fh)
+    }
+
+    return cx, cy, face_box
 
 
 def detect_subject_center_by_edges(img):
@@ -187,7 +196,7 @@ def detect_subject_center_by_edges(img):
     )
 
     if not contours:
-        return w // 2, h // 2
+        return int(w // 2), int(h // 2)
 
     valid = []
 
@@ -204,12 +213,12 @@ def detect_subject_center_by_edges(img):
         valid.append((x, y, cw, ch, area))
 
     if not valid:
-        return w // 2, h // 2
+        return int(w // 2), int(h // 2)
 
     x, y, cw, ch, _ = max(valid, key=lambda b: b[4])
 
-    cx = x + cw // 2
-    cy = y + ch // 2
+    cx = int(x + cw // 2)
+    cy = int(y + ch // 2)
 
     return cx, cy
 
@@ -220,15 +229,17 @@ def smart_subject_center(img):
     face = detect_face_center(img)
 
     if face:
-        cx, cy, box = face
+        cx, cy, face_box = face
 
-        # Nếu có mặt thì ưu tiên mặt, nhưng crop sẽ đặt mặt hơi cao hơn trung tâm
+        # Đưa tâm crop xuống dưới mặt một chút để lấy đủ ngực/thân,
+        # tránh bị crop nửa mặt hoặc lệch người.
         smart_cy = int(cy + h * 0.15)
-        return cx, smart_cy, "face", box
+
+        return int(cx), int(smart_cy), "face", face_box
 
     cx, cy = detect_subject_center_by_edges(img)
 
-    return cx, cy, "edge", None
+    return int(cx), int(cy), "edge", None
 
 
 def crop_9x16_around_center(img, center_x, center_y):
@@ -251,7 +262,9 @@ def crop_9x16_around_center(img, center_x, center_y):
     x2 = x1 + crop_w
     y2 = y1 + crop_h
 
-    return img[y1:y2, x1:x2], {
+    cropped = img[int(y1):int(y2), int(x1):int(x2)]
+
+    return cropped, {
         "x1": int(x1),
         "y1": int(y1),
         "x2": int(x2),
@@ -264,23 +277,27 @@ def resize_and_sharpen(img, width=1080, height=1920):
 
     cropped, crop_box = crop_9x16_around_center(img, cx, cy)
 
+    if cropped.size == 0:
+        cropped = img
+
     resized = cv2.resize(
         cropped,
         (width, height),
         interpolation=cv2.INTER_LANCZOS4
     )
 
-    # sharpen nhẹ, tránh làm ảnh giả
     blur = cv2.GaussianBlur(resized, (0, 0), 1.0)
     sharp = cv2.addWeighted(resized, 1.45, blur, -0.45, 0)
 
-    return sharp, {
+    debug = {
         "center_x": int(cx),
         "center_y": int(cy),
         "method": method,
         "face_box": face_box,
         "crop_9x16_box": crop_box
     }
+
+    return sharp, debug
 
 
 @app.post("/split-storyboard")
@@ -291,56 +308,66 @@ async def split_storyboard(
     width: int = Query(1080),
     height: int = Query(1920)
 ):
-    contents = await file.read()
+    try:
+        contents = await file.read()
 
-    arr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        arr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-    if img is None:
-        return JSONResponse(
-            {"error": "Cannot read image"},
-            status_code=400
-        )
+        if img is None:
+            return JSONResponse(
+                {"error": "Cannot read image"},
+                status_code=400
+            )
 
-    boxes = detect_storyboard_boxes(img, rows, cols)
+        boxes = detect_storyboard_boxes(img, rows, cols)
 
-    batch_id = str(uuid.uuid4())[:8]
-    scenes = []
+        batch_id = str(uuid.uuid4())[:8]
+        scenes = []
 
-    for i, (x1, y1, x2, y2) in enumerate(boxes, start=1):
-        frame = img[y1:y2, x1:x2]
+        for i, (x1, y1, x2, y2) in enumerate(boxes, start=1):
+            frame = img[y1:y2, x1:x2]
 
-        if frame.size == 0:
-            continue
+            if frame.size == 0:
+                continue
 
-        final_img, debug = resize_and_sharpen(frame, width, height)
+            final_img, debug = resize_and_sharpen(frame, width, height)
 
-        filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
-        path = os.path.join(OUTPUT_DIR, filename)
+            filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
+            path = os.path.join(OUTPUT_DIR, filename)
 
-        cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 96])
+            cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 96])
 
-        scenes.append({
-            "scene": i,
-            "fileName": filename,
-            "mimeType": "image/jpeg",
-            "width": width,
-            "height": height,
+            scenes.append({
+                "scene": int(i),
+                "fileName": filename,
+                "mimeType": "image/jpeg",
+                "width": int(width),
+                "height": int(height),
+                "ratio": "9:16",
+                "url": f"{BASE_URL}/files/{filename}",
+                "storyboard_box": {
+                    "x1": int(x1),
+                    "y1": int(y1),
+                    "x2": int(x2),
+                    "y2": int(y2)
+                },
+                "smart_crop": debug
+            })
+
+        return {
+            "total": len(scenes),
+            "width": int(width),
+            "height": int(height),
             "ratio": "9:16",
-            "url": f"{BASE_URL}/files/{filename}",
-            "storyboard_box": {
-                "x1": int(x1),
-                "y1": int(y1),
-                "x2": int(x2),
-                "y2": int(y2)
-            },
-            "smart_crop": debug
-        })
+            "scenes": scenes
+        }
 
-    return {
-        "total": len(scenes),
-        "width": width,
-        "height": height,
-        "ratio": "9:16",
-        "scenes": scenes
-    }
+    except Exception as e:
+        return JSONResponse(
+            {
+                "error": "Internal Server Error",
+                "detail": str(e)
+            },
+            status_code=500
+        )
