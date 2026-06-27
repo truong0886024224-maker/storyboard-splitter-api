@@ -19,7 +19,7 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API Fast is running"
+        "message": "Storyboard Splitter API Smart Crop is running"
     }
 
 
@@ -59,12 +59,12 @@ def find_white_separators(img):
 
     for a, b in v_groups:
         thickness = b - a + 1
-        if 2 <= thickness <= w * 0.05:
+        if 2 <= thickness <= w * 0.06:
             v_lines.append((a + b) // 2)
 
     for a, b in h_groups:
         thickness = b - a + 1
-        if 2 <= thickness <= h * 0.05:
+        if 2 <= thickness <= h * 0.06:
             h_lines.append((a + b) // 2)
 
     return v_lines, h_lines
@@ -144,34 +144,143 @@ def detect_storyboard_boxes(img, rows=0, cols=0):
     return sorted(boxes, key=lambda b: (b[1], b[0]))
 
 
-def crop_to_9x16(img):
+def detect_face_center(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    face_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(face_path)
+
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=4,
+        minSize=(30, 30)
+    )
+
+    if len(faces) == 0:
+        return None
+
+    # lấy mặt lớn nhất
+    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+
+    cx = x + w // 2
+    cy = y + h // 2
+
+    return cx, cy, (x, y, w, h)
+
+
+def detect_subject_center_by_edges(img):
+    h, w = img.shape[:2]
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 50, 150)
+
+    kernel = np.ones((7, 7), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(
+        edges,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return w // 2, h // 2
+
+    valid = []
+
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        area = cw * ch
+
+        if area < (w * h) * 0.03:
+            continue
+
+        if cw < w * 0.1 or ch < h * 0.1:
+            continue
+
+        valid.append((x, y, cw, ch, area))
+
+    if not valid:
+        return w // 2, h // 2
+
+    x, y, cw, ch, _ = max(valid, key=lambda b: b[4])
+
+    cx = x + cw // 2
+    cy = y + ch // 2
+
+    return cx, cy
+
+
+def smart_subject_center(img):
+    h, w = img.shape[:2]
+
+    face = detect_face_center(img)
+
+    if face:
+        cx, cy, box = face
+
+        # Nếu có mặt thì ưu tiên mặt, nhưng crop sẽ đặt mặt hơi cao hơn trung tâm
+        smart_cy = int(cy + h * 0.15)
+        return cx, smart_cy, "face", box
+
+    cx, cy = detect_subject_center_by_edges(img)
+
+    return cx, cy, "edge", None
+
+
+def crop_9x16_around_center(img, center_x, center_y):
     h, w = img.shape[:2]
     target_ratio = 9 / 16
-    current_ratio = w / h
 
-    if current_ratio > target_ratio:
-        new_w = int(h * target_ratio)
-        x1 = max(0, (w - new_w) // 2)
-        return img[:, x1:x1 + new_w]
+    crop_w = w
+    crop_h = int(crop_w / target_ratio)
 
-    new_h = int(w / target_ratio)
-    y1 = max(0, (h - new_h) // 2)
-    return img[y1:y1 + new_h, :]
+    if crop_h > h:
+        crop_h = h
+        crop_w = int(crop_h * target_ratio)
+
+    x1 = int(center_x - crop_w / 2)
+    y1 = int(center_y - crop_h / 2)
+
+    x1 = max(0, min(x1, w - crop_w))
+    y1 = max(0, min(y1, h - crop_h))
+
+    x2 = x1 + crop_w
+    y2 = y1 + crop_h
+
+    return img[y1:y2, x1:x2], {
+        "x1": int(x1),
+        "y1": int(y1),
+        "x2": int(x2),
+        "y2": int(y2)
+    }
 
 
-def resize_and_sharpen_fast(img, width=1080, height=1920):
-    img = crop_to_9x16(img)
+def resize_and_sharpen(img, width=1080, height=1920):
+    cx, cy, method, face_box = smart_subject_center(img)
+
+    cropped, crop_box = crop_9x16_around_center(img, cx, cy)
 
     resized = cv2.resize(
-        img,
+        cropped,
         (width, height),
         interpolation=cv2.INTER_LANCZOS4
     )
 
+    # sharpen nhẹ, tránh làm ảnh giả
     blur = cv2.GaussianBlur(resized, (0, 0), 1.0)
     sharp = cv2.addWeighted(resized, 1.45, blur, -0.45, 0)
 
-    return sharp
+    return sharp, {
+        "center_x": int(cx),
+        "center_y": int(cy),
+        "method": method,
+        "face_box": face_box,
+        "crop_9x16_box": crop_box
+    }
 
 
 @app.post("/split-storyboard")
@@ -199,12 +308,12 @@ async def split_storyboard(
     scenes = []
 
     for i, (x1, y1, x2, y2) in enumerate(boxes, start=1):
-        crop = img[y1:y2, x1:x2]
+        frame = img[y1:y2, x1:x2]
 
-        if crop.size == 0:
+        if frame.size == 0:
             continue
 
-        final_img = resize_and_sharpen_fast(crop, width, height)
+        final_img, debug = resize_and_sharpen(frame, width, height)
 
         filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
         path = os.path.join(OUTPUT_DIR, filename)
@@ -219,12 +328,13 @@ async def split_storyboard(
             "height": height,
             "ratio": "9:16",
             "url": f"{BASE_URL}/files/{filename}",
-            "box": {
+            "storyboard_box": {
                 "x1": int(x1),
                 "y1": int(y1),
                 "x2": int(x2),
                 "y2": int(y2)
-            }
+            },
+            "smart_crop": debug
         })
 
     return {
