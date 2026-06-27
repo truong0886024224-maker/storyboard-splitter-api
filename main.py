@@ -1,10 +1,18 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 import cv2
 import numpy as np
 import base64
+import os
+import uuid
 
 app = FastAPI()
+
+OUTPUT_DIR = "files"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 
 @app.get("/")
@@ -15,38 +23,10 @@ def home():
     }
 
 
-def make_9x16_full_hd(img, target_w=1080, target_h=1920):
-    h, w = img.shape[:2]
-
-    # Tạo nền blur 1080x1920
-    scale_bg = max(target_w / w, target_h / h)
-    bg_w = max(target_w, int(w * scale_bg))
-    bg_h = max(target_h, int(h * scale_bg))
-
-    bg = cv2.resize(img, (bg_w, bg_h), interpolation=cv2.INTER_CUBIC)
-
-    x = max(0, (bg_w - target_w) // 2)
-    y = max(0, (bg_h - target_h) // 2)
-
-    bg = bg[y:y + target_h, x:x + target_w]
-    bg = cv2.resize(bg, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-    bg = cv2.GaussianBlur(bg, (51, 51), 0)
-
-    # Ảnh chính giữ nguyên tỷ lệ, đặt ở giữa
-    scale_fg = min(target_w / w, target_h / h)
-    fg_w = max(1, int(w * scale_fg))
-    fg_h = max(1, int(h * scale_fg))
-
-    fg = cv2.resize(img, (fg_w, fg_h), interpolation=cv2.INTER_CUBIC)
-
-    canvas = bg.copy()
-
-    x1 = (target_w - fg_w) // 2
-    y1 = (target_h - fg_h) // 2
-
-    canvas[y1:y1 + fg_h, x1:x1 + fg_w] = fg
-
-    return canvas
+def save_image(img, filename):
+    path = os.path.join(OUTPUT_DIR, filename)
+    cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    return path
 
 
 @app.post("/split-storyboard")
@@ -64,7 +44,6 @@ async def split_storyboard(file: UploadFile = File(...)):
 
     h, w = img.shape[:2]
 
-    # Layout ảnh hiện tại: 2 cột x 4 hàng
     rows = 4
     cols = 2
     margin = 4
@@ -72,8 +51,12 @@ async def split_storyboard(file: UploadFile = File(...)):
     scenes = []
     index = 1
 
+    batch_id = str(uuid.uuid4())[:8]
+
     cell_w = w // cols
     cell_h = h // rows
+
+    base_url = "https://storyboard-splitter-api.onrender.com"
 
     for r in range(rows):
         for c in range(cols):
@@ -87,21 +70,21 @@ async def split_storyboard(file: UploadFile = File(...)):
             if crop.shape[0] > margin * 2 and crop.shape[1] > margin * 2:
                 crop = crop[margin:-margin, margin:-margin]
 
-            final_img = make_9x16_full_hd(crop)
+            filename = f"{batch_id}_scene_{index:03}.jpg"
+            save_image(crop, filename)
 
             ok, buffer = cv2.imencode(
                 ".jpg",
-                final_img,
+                crop,
                 [cv2.IMWRITE_JPEG_QUALITY, 95]
             )
 
             if ok:
                 scenes.append({
                     "scene": index,
-                    "fileName": f"scene_{index:03}_9x16_1080x1920.jpg",
+                    "fileName": filename,
                     "mimeType": "image/jpeg",
-                    "width": 1080,
-                    "height": 1920,
+                    "url": f"{base_url}/files/{filename}",
                     "base64": base64.b64encode(buffer).decode("utf-8")
                 })
 
