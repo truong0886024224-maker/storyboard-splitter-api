@@ -19,13 +19,14 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API 9x16 Blur Background is running"
+        "message": "Storyboard Splitter API 9x16 Blur Background Fixed is running"
     }
 
 
 def fallback_grid(img, rows, cols):
     h, w = img.shape[:2]
     boxes = []
+
     cell_w = w // cols
     cell_h = h // rows
 
@@ -35,7 +36,13 @@ def fallback_grid(img, rows, cols):
             y1 = r * cell_h + 4
             x2 = (c + 1) * cell_w - 4 if c < cols - 1 else w - 4
             y2 = (r + 1) * cell_h - 4 if r < rows - 1 else h - 4
-            boxes.append((x1, y1, x2, y2))
+
+            boxes.append((
+                max(0, int(x1)),
+                max(0, int(y1)),
+                min(w, int(x2)),
+                min(h, int(y2))
+            ))
 
     return boxes
 
@@ -43,16 +50,17 @@ def fallback_grid(img, rows, cols):
 def border_score(img, rows, cols):
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
     scores = []
 
     for c in range(1, cols):
         x = int(w * c / cols)
-        band = gray[:, max(0, x - 3):min(w, x + 3)]
+        band = gray[:, max(0, x - 4):min(w, x + 4)]
         scores.append(float(np.mean(band > 225)))
 
     for r in range(1, rows):
         y = int(h * r / rows)
-        band = gray[max(0, y - 3):min(h, y + 3), :]
+        band = gray[max(0, y - 4):min(h, y + 4), :]
         scores.append(float(np.mean(band > 225)))
 
     return float(np.mean(scores)) if scores else 0.0
@@ -60,8 +68,14 @@ def border_score(img, rows, cols):
 
 def choose_auto_layout(img):
     candidates = [
-        (4, 2), (3, 2), (3, 3), (4, 3),
-        (5, 2), (2, 2), (2, 3), (5, 3)
+        (4, 2),
+        (3, 2),
+        (3, 3),
+        (4, 3),
+        (5, 2),
+        (2, 2),
+        (2, 3),
+        (5, 3),
     ]
 
     best = (4, 2)
@@ -69,6 +83,7 @@ def choose_auto_layout(img):
 
     for rows, cols in candidates:
         score = border_score(img, rows, cols)
+
         if score > best_score:
             best_score = score
             best = (rows, cols)
@@ -79,47 +94,67 @@ def choose_auto_layout(img):
 def detect_layout(img, rows=0, cols=0):
     if rows > 0 and cols > 0:
         return rows, cols
+
     return choose_auto_layout(img)
 
 
 def make_9x16_blur_background(img, width=1080, height=1920):
     h, w = img.shape[:2]
 
-    # nền full 9:16 bằng ảnh phóng to + blur
+    if h <= 0 or w <= 0:
+        raise ValueError("Invalid image size")
+
+    # 1. Nền blur phủ kín 9:16, không bị thiếu chiều cao/rộng
     scale_bg = max(width / w, height / h)
-    bg_w = int(w * scale_bg)
-    bg_h = int(h * scale_bg)
+    bg_w = max(width, int(round(w * scale_bg)) + 4)
+    bg_h = max(height, int(round(h * scale_bg)) + 4)
 
-    bg = cv2.resize(img, (bg_w, bg_h), interpolation=cv2.INTER_CUBIC)
+    bg = cv2.resize(
+        img,
+        (bg_w, bg_h),
+        interpolation=cv2.INTER_CUBIC
+    )
 
-    x_bg = (bg_w - width) // 2
-    y_bg = (bg_h - height) // 2
+    x_bg = max(0, (bg_w - width) // 2)
+    y_bg = max(0, (bg_h - height) // 2)
+
     bg = bg[y_bg:y_bg + height, x_bg:x_bg + width]
 
-    bg = cv2.GaussianBlur(bg, (0, 0), 32)
+    # Fix chắc chắn đúng size 1080x1920
+    if bg.shape[0] != height or bg.shape[1] != width:
+        bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_CUBIC)
 
-    # làm nền tối nhẹ để ảnh chính nổi hơn
+    bg = cv2.GaussianBlur(bg, (0, 0), 32)
     bg = cv2.addWeighted(bg, 0.75, np.zeros_like(bg), 0.25, 0)
 
-    # ảnh chính giữ nguyên tỉ lệ, không crop
+    # 2. Ảnh chính giữ nguyên tỉ lệ, không crop, không vỡ bố cục
     scale_fg = min(width / w, height / h)
-    fg_w = int(w * scale_fg)
-    fg_h = int(h * scale_fg)
+    fg_w = max(1, int(round(w * scale_fg)))
+    fg_h = max(1, int(round(h * scale_fg)))
 
-    fg = cv2.resize(img, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+    fg = cv2.resize(
+        img,
+        (fg_w, fg_h),
+        interpolation=cv2.INTER_LANCZOS4
+    )
 
-    # sharpen ảnh chính
+    # Sharpen ảnh chính
     blur = cv2.GaussianBlur(fg, (0, 0), 1.0)
-    fg = cv2.addWeighted(fg, 1.45, blur, -0.45, 0)
+    fg = cv2.addWeighted(fg, 1.4, blur, -0.4, 0)
 
-    x = (width - fg_w) // 2
-    y = (height - fg_h) // 2
+    x = max(0, (width - fg_w) // 2)
+    y = max(0, (height - fg_h) // 2)
 
     canvas = bg.copy()
-    canvas[y:y + fg_h, x:x + fg_w] = fg
+
+    # Fix nếu fg sát biên
+    paste_w = min(fg_w, width - x)
+    paste_h = min(fg_h, height - y)
+
+    canvas[y:y + paste_h, x:x + paste_w] = fg[:paste_h, :paste_w]
 
     return canvas, {
-        "mode": "9x16_blur_background_keep_original",
+        "mode": "9x16_blur_background_keep_original_fixed",
         "original_width": int(w),
         "original_height": int(h),
         "foreground_width": int(fg_w),
@@ -143,7 +178,10 @@ async def split_storyboard(
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return JSONResponse({"error": "Cannot read image"}, status_code=400)
+            return JSONResponse(
+                {"error": "Cannot read image"},
+                status_code=400
+            )
 
         final_rows, final_cols = detect_layout(img, rows, cols)
         boxes = fallback_grid(img, final_rows, final_cols)
@@ -157,7 +195,11 @@ async def split_storyboard(
             if frame.size == 0:
                 continue
 
-            final_img, debug = make_9x16_blur_background(frame, width, height)
+            final_img, debug = make_9x16_blur_background(
+                frame,
+                width,
+                height
+            )
 
             filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
@@ -199,6 +241,9 @@ async def split_storyboard(
 
     except Exception as e:
         return JSONResponse(
-            {"error": "Internal Server Error", "detail": str(e)},
+            {
+                "error": "Internal Server Error",
+                "detail": str(e)
+            },
             status_code=500
         )
