@@ -17,16 +17,12 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 @app.get("/")
 def home():
-    return {
-        "status": "ok",
-        "message": "Storyboard Splitter API 9x16 Blur Background Fixed is running"
-    }
+    return {"status": "ok", "message": "Storyboard Splitter API 9x16 Extend Background"}
 
 
 def fallback_grid(img, rows, cols):
     h, w = img.shape[:2]
     boxes = []
-
     cell_w = w // cols
     cell_h = h // rows
 
@@ -36,13 +32,7 @@ def fallback_grid(img, rows, cols):
             y1 = r * cell_h + 4
             x2 = (c + 1) * cell_w - 4 if c < cols - 1 else w - 4
             y2 = (r + 1) * cell_h - 4 if r < rows - 1 else h - 4
-
-            boxes.append((
-                max(0, int(x1)),
-                max(0, int(y1)),
-                min(w, int(x2)),
-                min(h, int(y2))
-            ))
+            boxes.append((max(0, x1), max(0, y1), min(w, x2), min(h, y2)))
 
     return boxes
 
@@ -50,7 +40,6 @@ def fallback_grid(img, rows, cols):
 def border_score(img, rows, cols):
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
     scores = []
 
     for c in range(1, cols):
@@ -68,14 +57,8 @@ def border_score(img, rows, cols):
 
 def choose_auto_layout(img):
     candidates = [
-        (4, 2),
-        (3, 2),
-        (3, 3),
-        (4, 3),
-        (5, 2),
-        (2, 2),
-        (2, 3),
-        (5, 3),
+        (4, 2), (3, 2), (3, 3), (4, 3),
+        (5, 2), (2, 2), (2, 3), (5, 3)
     ]
 
     best = (4, 2)
@@ -83,7 +66,6 @@ def choose_auto_layout(img):
 
     for rows, cols in candidates:
         score = border_score(img, rows, cols)
-
         if score > best_score:
             best_score = score
             best = (rows, cols)
@@ -94,71 +76,73 @@ def choose_auto_layout(img):
 def detect_layout(img, rows=0, cols=0):
     if rows > 0 and cols > 0:
         return rows, cols
-
     return choose_auto_layout(img)
 
 
-def make_9x16_blur_background(img, width=1080, height=1920):
+def sharpen(img):
+    blur = cv2.GaussianBlur(img, (0, 0), 1.0)
+    return cv2.addWeighted(img, 1.35, blur, -0.35, 0)
+
+
+def make_background_from_edges(img, width, height):
     h, w = img.shape[:2]
 
-    if h <= 0 or w <= 0:
-        raise ValueError("Invalid image size")
+    # Lấy màu nền từ viền trên/trái/phải, tránh lấy chủ thể ở giữa
+    top = img[0:max(2, h // 8), :, :]
+    left = img[:, 0:max(2, w // 10), :]
+    right = img[:, max(0, w - w // 10):w, :]
 
-    # 1. Nền blur phủ kín 9:16, không bị thiếu chiều cao/rộng
-    scale_bg = max(width / w, height / h)
-    bg_w = max(width, int(round(w * scale_bg)) + 4)
-    bg_h = max(height, int(round(h * scale_bg)) + 4)
+    samples = np.concatenate([
+        top.reshape(-1, 3),
+        left.reshape(-1, 3),
+        right.reshape(-1, 3)
+    ], axis=0)
 
-    bg = cv2.resize(
-        img,
-        (bg_w, bg_h),
-        interpolation=cv2.INTER_CUBIC
-    )
+    avg = np.mean(samples, axis=0).astype(np.uint8)
 
-    x_bg = max(0, (bg_w - width) // 2)
-    y_bg = max(0, (bg_h - height) // 2)
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:] = avg
 
-    bg = bg[y_bg:y_bg + height, x_bg:x_bg + width]
+    # Tạo gradient nền tự nhiên hơn, không dùng blur ảnh chính
+    for y in range(height):
+        factor = y / height
+        shade = 0.85 + 0.25 * (1 - abs(factor - 0.45))
+        color = np.clip(avg.astype(np.float32) * shade, 0, 255).astype(np.uint8)
+        canvas[y, :] = color
 
-    # Fix chắc chắn đúng size 1080x1920
-    if bg.shape[0] != height or bg.shape[1] != width:
-        bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_CUBIC)
+    return canvas
 
-    bg = cv2.GaussianBlur(bg, (0, 0), 32)
-    bg = cv2.addWeighted(bg, 0.75, np.zeros_like(bg), 0.25, 0)
 
-    # 2. Ảnh chính giữ nguyên tỉ lệ, không crop, không vỡ bố cục
-    scale_fg = min(width / w, height / h)
-    fg_w = max(1, int(round(w * scale_fg)))
-    fg_h = max(1, int(round(h * scale_fg)))
+def extend_to_9x16(img, width=1080, height=1920):
+    h, w = img.shape[:2]
 
-    fg = cv2.resize(
-        img,
-        (fg_w, fg_h),
-        interpolation=cv2.INTER_LANCZOS4
-    )
+    # Nền mở rộng từ màu/texture viền ảnh
+    canvas = make_background_from_edges(img, width, height)
 
-    # Sharpen ảnh chính
-    blur = cv2.GaussianBlur(fg, (0, 0), 1.0)
-    fg = cv2.addWeighted(fg, 1.4, blur, -0.4, 0)
+    # Ảnh chính scale theo chiều rộng để giống mẫu bạn muốn
+    scale = width / w
+    new_w = width
+    new_h = int(h * scale)
 
-    x = max(0, (width - fg_w) // 2)
-    y = max(0, (height - fg_h) // 2)
+    if new_h > height:
+        scale = height / h
+        new_h = height
+        new_w = int(w * scale)
 
-    canvas = bg.copy()
+    fg = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    fg = sharpen(fg)
 
-    # Fix nếu fg sát biên
-    paste_w = min(fg_w, width - x)
-    paste_h = min(fg_h, height - y)
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
 
-    canvas[y:y + paste_h, x:x + paste_w] = fg[:paste_h, :paste_w]
+    canvas[y:y + new_h, x:x + new_w] = fg
 
     return canvas, {
-        "mode": "9x16_blur_background_keep_original_fixed",
+        "mode": "extend_background_no_black_no_blur",
         "original_width": int(w),
         "original_height": int(h),
-        "foreground_width": int(fg_w),
-        "foreground_height": int(fg_h),
+        "foreground_width": int(new_w),
+        "foreground_height": int(new_h),
         "x": int(x),
         "y": int(y)
     }
@@ -178,10 +162,7 @@ async def split_storyboard(
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return JSONResponse(
-                {"error": "Cannot read image"},
-                status_code=400
-            )
+            return JSONResponse({"error": "Cannot read image"}, status_code=400)
 
         final_rows, final_cols = detect_layout(img, rows, cols)
         boxes = fallback_grid(img, final_rows, final_cols)
@@ -195,13 +176,9 @@ async def split_storyboard(
             if frame.size == 0:
                 continue
 
-            final_img, debug = make_9x16_blur_background(
-                frame,
-                width,
-                height
-            )
+            final_img, debug = extend_to_9x16(frame, width, height)
 
-            filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
+            filename = f"{batch_id}_scene_{i:03}_9x16_extend_{width}x{height}.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
 
             cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 96])
@@ -241,9 +218,6 @@ async def split_storyboard(
 
     except Exception as e:
         return JSONResponse(
-            {
-                "error": "Internal Server Error",
-                "detail": str(e)
-            },
+            {"error": "Internal Server Error", "detail": str(e)},
             status_code=500
         )
