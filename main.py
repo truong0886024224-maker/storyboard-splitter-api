@@ -6,48 +6,65 @@ import base64
 
 app = FastAPI()
 
+
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Storyboard Splitter API is running"}
+    return {
+        "status": "ok",
+        "message": "Storyboard Splitter API is running"
+    }
+
 
 def make_9x16_full_hd(img, target_w=1080, target_h=1920):
     h, w = img.shape[:2]
 
-    # Nền blur full 1080x1920
+    # Tạo nền blur 1080x1920
     scale_bg = max(target_w / w, target_h / h)
-    bg_w = int(w * scale_bg)
-    bg_h = int(h * scale_bg)
+    bg_w = max(target_w, int(w * scale_bg))
+    bg_h = max(target_h, int(h * scale_bg))
+
     bg = cv2.resize(img, (bg_w, bg_h), interpolation=cv2.INTER_CUBIC)
 
-    x = (bg_w - target_w) // 2
-    y = (bg_h - target_h) // 2
-    bg = bg[y:y+target_h, x:x+target_w]
+    x = max(0, (bg_w - target_w) // 2)
+    y = max(0, (bg_h - target_h) // 2)
+
+    bg = bg[y:y + target_h, x:x + target_w]
+    bg = cv2.resize(bg, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
     bg = cv2.GaussianBlur(bg, (51, 51), 0)
 
-    # Ảnh chính giữ nguyên tỷ lệ, nằm giữa
+    # Ảnh chính giữ nguyên tỷ lệ, đặt ở giữa
     scale_fg = min(target_w / w, target_h / h)
-    fg_w = int(w * scale_fg)
-    fg_h = int(h * scale_fg)
+    fg_w = max(1, int(w * scale_fg))
+    fg_h = max(1, int(h * scale_fg))
+
     fg = cv2.resize(img, (fg_w, fg_h), interpolation=cv2.INTER_CUBIC)
 
     canvas = bg.copy()
+
     x1 = (target_w - fg_w) // 2
     y1 = (target_h - fg_h) // 2
-    canvas[y1:y1+fg_h, x1:x1+fg_w] = fg
+
+    canvas[y1:y1 + fg_h, x1:x1 + fg_w] = fg
 
     return canvas
+
 
 @app.post("/split-storyboard")
 async def split_storyboard(file: UploadFile = File(...)):
     contents = await file.read()
+
     arr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     if img is None:
-        return JSONResponse({"error": "Cannot read image"}, status_code=400)
+        return JSONResponse(
+            {"error": "Cannot read image"},
+            status_code=400
+        )
 
     h, w = img.shape[:2]
 
+    # Layout ảnh hiện tại: 2 cột x 4 hàng
     rows = 4
     cols = 2
     margin = 4
@@ -72,7 +89,11 @@ async def split_storyboard(file: UploadFile = File(...)):
 
             final_img = make_9x16_full_hd(crop)
 
-            ok, buffer = cv2.imencode(".jpg", final_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            ok, buffer = cv2.imencode(
+                ".jpg",
+                final_img,
+                [cv2.IMWRITE_JPEG_QUALITY, 95]
+            )
 
             if ok:
                 scenes.append({
@@ -86,4 +107,7 @@ async def split_storyboard(file: UploadFile = File(...)):
 
             index += 1
 
-    return {"total": len(scenes), "scenes": scenes}
+    return {
+        "total": len(scenes),
+        "scenes": scenes
+    }
