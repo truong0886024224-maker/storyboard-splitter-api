@@ -18,82 +18,65 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Storyboard Splitter API is running"}
+    return {
+        "status": "ok",
+        "message": "Storyboard Splitter API Pro is running"
+    }
 
 
-def crop_to_9x16(img):
+def group_indices(indices, max_gap=5):
+    if len(indices) == 0:
+        return []
+
+    groups = []
+    start = indices[0]
+    prev = indices[0]
+
+    for idx in indices[1:]:
+        if idx - prev > max_gap:
+            groups.append((start, prev))
+            start = idx
+        prev = idx
+
+    groups.append((start, prev))
+    return groups
+
+
+def find_white_separators(img):
     h, w = img.shape[:2]
-    target_ratio = 9 / 16
-    current_ratio = w / h
-
-    if current_ratio > target_ratio:
-        new_w = int(h * target_ratio)
-        x1 = (w - new_w) // 2
-        img = img[:, x1:x1 + new_w]
-    else:
-        new_h = int(w / target_ratio)
-        y1 = max(0, (h - new_h) // 2)
-        img = img[y1:y1 + new_h, :]
-
-    return img
-
-
-def enhance_image(img, target_w=1080, target_h=1920):
-    img = crop_to_9x16(img)
-
-    img = cv2.resize(
-        img,
-        (target_w, target_h),
-        interpolation=cv2.INTER_LANCZOS4
-    )
-
-    # sharpen nhẹ, không làm giả ảnh quá mạnh
-    blur = cv2.GaussianBlur(img, (0, 0), 1.2)
-    sharp = cv2.addWeighted(img, 1.35, blur, -0.35, 0)
-
-    return sharp
-
-
-def detect_grid(img):
-    h, w = img.shape[:2]
-
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # tìm đường trắng/ngăn cách giữa các frame
+    # Detect near-white gutters
     vertical_score = np.mean(gray > 235, axis=0)
     horizontal_score = np.mean(gray > 235, axis=1)
 
-    v_lines = np.where(vertical_score > 0.75)[0]
-    h_lines = np.where(horizontal_score > 0.75)[0]
+    v_candidates = np.where(vertical_score > 0.65)[0]
+    h_candidates = np.where(horizontal_score > 0.65)[0]
 
-    def group_lines(lines):
-        groups = []
-        if len(lines) == 0:
-            return groups
+    v_groups = group_indices(v_candidates, max_gap=6)
+    h_groups = group_indices(h_candidates, max_gap=6)
 
-        start = lines[0]
-        prev = lines[0]
+    v_lines = []
+    h_lines = []
 
-        for x in lines[1:]:
-            if x - prev > 3:
-                groups.append((start, prev))
-                start = x
-            prev = x
+    for a, b in v_groups:
+        thickness = b - a + 1
+        if 2 <= thickness <= w * 0.05:
+            v_lines.append((a + b) // 2)
 
-        groups.append((start, prev))
-        return groups
+    for a, b in h_groups:
+        thickness = b - a + 1
+        if 2 <= thickness <= h * 0.05:
+            h_lines.append((a + b) // 2)
 
-    v_groups = group_lines(v_lines)
-    h_groups = group_lines(h_lines)
+    return v_lines, h_lines
 
-    v_centers = [int((a + b) / 2) for a, b in v_groups if b - a > 1]
-    h_centers = [int((a + b) / 2) for a, b in h_groups if b - a > 1]
 
-    xs = [0] + v_centers + [w]
-    ys = [0] + h_centers + [h]
+def boxes_from_lines(img, v_lines, h_lines):
+    h, w = img.shape[:2]
 
-    xs = sorted(list(set(xs)))
-    ys = sorted(list(set(ys)))
+    xs = [0] + sorted(v_lines) + [w]
+    ys = [0] + sorted(h_lines) + [h]
 
     boxes = []
 
@@ -108,7 +91,7 @@ def detect_grid(img):
             if bw < w * 0.12 or bh < h * 0.12:
                 continue
 
-            margin = 4
+            margin = 3
             boxes.append((
                 max(0, x1 + margin),
                 max(0, y1 + margin),
@@ -119,7 +102,7 @@ def detect_grid(img):
     return boxes
 
 
-def fallback_grid(img, rows, cols):
+def fallback_grid(img, rows=4, cols=3):
     h, w = img.shape[:2]
     boxes = []
 
@@ -144,6 +127,74 @@ def fallback_grid(img, rows, cols):
     return boxes
 
 
+def detect_storyboard_boxes(img, rows=0, cols=0):
+    if rows > 0 and cols > 0:
+        return fallback_grid(img, rows, cols)
+
+    v_lines, h_lines = find_white_separators(img)
+    boxes = boxes_from_lines(img, v_lines, h_lines)
+
+    # If auto detection fails, fallback to common layouts
+    if len(boxes) < 4:
+        h, w = img.shape[:2]
+        ratio = w / h
+
+        # Tall storyboard usually 3 cols x 4 rows
+        if ratio < 0.8:
+            boxes = fallback_grid(img, 4, 3)
+        else:
+            boxes = fallback_grid(img, 4, 2)
+
+    # Sort top-to-bottom, left-to-right
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+
+    return boxes
+
+
+def crop_to_9x16(img):
+    h, w = img.shape[:2]
+    target_ratio = 9 / 16
+    current_ratio = w / h
+
+    if current_ratio > target_ratio:
+        # Too wide, crop left/right
+        new_w = int(h * target_ratio)
+        x1 = max(0, (w - new_w) // 2)
+        return img[:, x1:x1 + new_w]
+
+    else:
+        # Too tall, crop top/bottom
+        new_h = int(w / target_ratio)
+        y1 = max(0, (h - new_h) // 2)
+        return img[y1:y1 + new_h, :]
+
+
+def resize_and_sharpen(img, width=1080, height=1920):
+    img = crop_to_9x16(img)
+
+    resized = cv2.resize(
+        img,
+        (width, height),
+        interpolation=cv2.INTER_LANCZOS4
+    )
+
+    # Gentle contrast
+    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+
+    enhanced = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+    # Gentle sharpening
+    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.1)
+    sharp = cv2.addWeighted(enhanced, 1.28, blur, -0.28, 0)
+
+    return sharp
+
+
 @app.post("/split-storyboard")
 async def split_storyboard(
     file: UploadFile = File(...),
@@ -158,16 +209,12 @@ async def split_storyboard(
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     if img is None:
-        return JSONResponse({"error": "Cannot read image"}, status_code=400)
+        return JSONResponse(
+            {"error": "Cannot read image"},
+            status_code=400
+        )
 
-    if rows > 0 and cols > 0:
-        boxes = fallback_grid(img, rows, cols)
-    else:
-        boxes = detect_grid(img)
-
-        # nếu auto detect fail thì fallback phổ biến 4x3
-        if len(boxes) < 4:
-            boxes = fallback_grid(img, 4, 3)
+    boxes = detect_storyboard_boxes(img, rows, cols)
 
     batch_id = str(uuid.uuid4())[:8]
     scenes = []
@@ -178,7 +225,7 @@ async def split_storyboard(
         if crop.size == 0:
             continue
 
-        final_img = enhance_image(crop, width, height)
+        final_img = resize_and_sharpen(crop, width, height)
 
         filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
         path = os.path.join(OUTPUT_DIR, filename)
@@ -197,8 +244,15 @@ async def split_storyboard(
             "mimeType": "image/jpeg",
             "width": width,
             "height": height,
+            "ratio": "9:16",
             "url": f"{BASE_URL}/files/{filename}",
-            "base64": base64.b64encode(buffer).decode("utf-8") if ok else None
+            "base64": base64.b64encode(buffer).decode("utf-8") if ok else None,
+            "box": {
+                "x1": int(x1),
+                "y1": int(y1),
+                "x2": int(x2),
+                "y2": int(y2)
+            }
         })
 
     return {
