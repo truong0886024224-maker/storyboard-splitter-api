@@ -19,93 +19,13 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API Smart Crop Fixed is running"
+        "message": "Storyboard Splitter API Auto Layout Pro is running"
     }
 
 
-def group_indices(indices, max_gap=5):
-    if len(indices) == 0:
-        return []
-
-    groups = []
-    start = int(indices[0])
-    prev = int(indices[0])
-
-    for idx in indices[1:]:
-        idx = int(idx)
-        if idx - prev > max_gap:
-            groups.append((start, prev))
-            start = idx
-        prev = idx
-
-    groups.append((start, prev))
-    return groups
-
-
-def find_white_separators(img):
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    vertical_score = np.mean(gray > 235, axis=0)
-    horizontal_score = np.mean(gray > 235, axis=1)
-
-    v_candidates = np.where(vertical_score > 0.65)[0]
-    h_candidates = np.where(horizontal_score > 0.65)[0]
-
-    v_groups = group_indices(v_candidates, max_gap=6)
-    h_groups = group_indices(h_candidates, max_gap=6)
-
-    v_lines = []
-    h_lines = []
-
-    for a, b in v_groups:
-        thickness = b - a + 1
-        if 2 <= thickness <= w * 0.06:
-            v_lines.append(int((a + b) // 2))
-
-    for a, b in h_groups:
-        thickness = b - a + 1
-        if 2 <= thickness <= h * 0.06:
-            h_lines.append(int((a + b) // 2))
-
-    return v_lines, h_lines
-
-
-def boxes_from_lines(img, v_lines, h_lines):
-    h, w = img.shape[:2]
-
-    xs = [0] + sorted(v_lines) + [w]
-    ys = [0] + sorted(h_lines) + [h]
-
-    boxes = []
-
-    for r in range(len(ys) - 1):
-        for c in range(len(xs) - 1):
-            x1, x2 = xs[c], xs[c + 1]
-            y1, y2 = ys[r], ys[r + 1]
-
-            bw = x2 - x1
-            bh = y2 - y1
-
-            if bw < w * 0.12 or bh < h * 0.12:
-                continue
-
-            margin = 3
-
-            boxes.append((
-                int(max(0, x1 + margin)),
-                int(max(0, y1 + margin)),
-                int(min(w, x2 - margin)),
-                int(min(h, y2 - margin))
-            ))
-
-    return boxes
-
-
-def fallback_grid(img, rows=4, cols=3):
+def fallback_grid(img, rows, cols):
     h, w = img.shape[:2]
     boxes = []
-
     cell_w = w // cols
     cell_h = h // rows
 
@@ -117,34 +37,78 @@ def fallback_grid(img, rows=4, cols=3):
             y2 = (r + 1) * cell_h if r < rows - 1 else h
 
             margin = 4
-
             boxes.append((
-                int(max(0, x1 + margin)),
-                int(max(0, y1 + margin)),
-                int(min(w, x2 - margin)),
-                int(min(h, y2 - margin))
+                max(0, x1 + margin),
+                max(0, y1 + margin),
+                min(w, x2 - margin),
+                min(h, y2 - margin)
             ))
 
     return boxes
 
 
-def detect_storyboard_boxes(img, rows=0, cols=0):
+def border_score(img, rows, cols):
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    scores = []
+
+    for c in range(1, cols):
+        x = int(w * c / cols)
+        band = gray[:, max(0, x - 3):min(w, x + 3)]
+        scores.append(float(np.mean(band > 225)))
+
+    for r in range(1, rows):
+        y = int(h * r / rows)
+        band = gray[max(0, y - 3):min(h, y + 3), :]
+        scores.append(float(np.mean(band > 225)))
+
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def choose_auto_layout(img):
+    h, w = img.shape[:2]
+    ratio = w / h
+
+    candidates = [
+        (4, 2),   # 8 ảnh dọc
+        (3, 2),   # 6 ảnh
+        (3, 3),   # 9 ảnh
+        (4, 3),   # 12 ảnh
+        (5, 2),   # 10 ảnh
+        (2, 2),   # 4 ảnh
+        (2, 3),   # 6 ảnh ngang
+        (5, 3),   # 15 ảnh
+    ]
+
+    best = None
+    best_score = -999
+
+    for rows, cols in candidates:
+        score = border_score(img, rows, cols)
+
+        expected_ratio = cols / rows
+        ratio_penalty = abs(ratio - expected_ratio) * 0.25
+
+        # Ưu tiên layout phổ biến dọc
+        common_bonus = 0
+        if (rows, cols) in [(4, 2), (4, 3), (3, 3), (3, 2)]:
+            common_bonus = 0.08
+
+        final_score = score - ratio_penalty + common_bonus
+
+        if final_score > best_score:
+            best_score = final_score
+            best = (rows, cols)
+
+    return best
+
+
+def detect_layout(img, rows=0, cols=0):
     if rows > 0 and cols > 0:
-        return fallback_grid(img, rows, cols)
+        return rows, cols
 
-    v_lines, h_lines = find_white_separators(img)
-    boxes = boxes_from_lines(img, v_lines, h_lines)
-
-    if len(boxes) < 4:
-        h, w = img.shape[:2]
-        ratio = w / h
-
-        if ratio < 0.8:
-            boxes = fallback_grid(img, 4, 3)
-        else:
-            boxes = fallback_grid(img, 4, 2)
-
-    return sorted(boxes, key=lambda b: (b[1], b[0]))
+    return choose_auto_layout(img)
 
 
 def detect_face_center(img):
@@ -165,17 +129,16 @@ def detect_face_center(img):
 
     x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
 
-    cx = int(x + fw // 2)
-    cy = int(y + fh // 2)
-
-    face_box = {
-        "x": int(x),
-        "y": int(y),
-        "w": int(fw),
-        "h": int(fh)
+    return {
+        "cx": int(x + fw // 2),
+        "cy": int(y + fh // 2),
+        "box": {
+            "x": int(x),
+            "y": int(y),
+            "w": int(fw),
+            "h": int(fh)
+        }
     }
-
-    return cx, cy, face_box
 
 
 def detect_subject_center_by_edges(img):
@@ -183,7 +146,6 @@ def detect_subject_center_by_edges(img):
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
     edges = cv2.Canny(blur, 50, 150)
 
     kernel = np.ones((7, 7), np.uint8)
@@ -195,9 +157,6 @@ def detect_subject_center_by_edges(img):
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    if not contours:
-        return int(w // 2), int(h // 2)
-
     valid = []
 
     for cnt in contours:
@@ -206,7 +165,6 @@ def detect_subject_center_by_edges(img):
 
         if area < (w * h) * 0.03:
             continue
-
         if cw < w * 0.1 or ch < h * 0.1:
             continue
 
@@ -217,10 +175,7 @@ def detect_subject_center_by_edges(img):
 
     x, y, cw, ch, _ = max(valid, key=lambda b: b[4])
 
-    cx = int(x + cw // 2)
-    cy = int(y + ch // 2)
-
-    return cx, cy
+    return int(x + cw // 2), int(y + ch // 2)
 
 
 def smart_subject_center(img):
@@ -229,16 +184,11 @@ def smart_subject_center(img):
     face = detect_face_center(img)
 
     if face:
-        cx, cy, face_box = face
-
-        # Đưa tâm crop xuống dưới mặt một chút để lấy đủ ngực/thân,
-        # tránh bị crop nửa mặt hoặc lệch người.
-        smart_cy = int(cy + h * 0.15)
-
-        return int(cx), int(smart_cy), "face", face_box
+        cx = face["cx"]
+        cy = int(face["cy"] + h * 0.15)
+        return cx, cy, "face", face["box"]
 
     cx, cy = detect_subject_center_by_edges(img)
-
     return int(cx), int(cy), "edge", None
 
 
@@ -262,7 +212,7 @@ def crop_9x16_around_center(img, center_x, center_y):
     x2 = x1 + crop_w
     y2 = y1 + crop_h
 
-    cropped = img[int(y1):int(y2), int(x1):int(x2)]
+    cropped = img[y1:y2, x1:x2]
 
     return cropped, {
         "x1": int(x1),
@@ -287,7 +237,7 @@ def resize_and_sharpen(img, width=1080, height=1920):
     )
 
     blur = cv2.GaussianBlur(resized, (0, 0), 1.0)
-    sharp = cv2.addWeighted(resized, 1.45, blur, -0.45, 0)
+    sharp = cv2.addWeighted(resized, 1.4, blur, -0.4, 0)
 
     debug = {
         "center_x": int(cx),
@@ -320,7 +270,8 @@ async def split_storyboard(
                 status_code=400
             )
 
-        boxes = detect_storyboard_boxes(img, rows, cols)
+        final_rows, final_cols = detect_layout(img, rows, cols)
+        boxes = fallback_grid(img, final_rows, final_cols)
 
         batch_id = str(uuid.uuid4())[:8]
         scenes = []
@@ -346,6 +297,10 @@ async def split_storyboard(
                 "height": int(height),
                 "ratio": "9:16",
                 "url": f"{BASE_URL}/files/{filename}",
+                "layout": {
+                    "rows": int(final_rows),
+                    "cols": int(final_cols)
+                },
                 "storyboard_box": {
                     "x1": int(x1),
                     "y1": int(y1),
@@ -357,6 +312,10 @@ async def split_storyboard(
 
         return {
             "total": len(scenes),
+            "layout": {
+                "rows": int(final_rows),
+                "cols": int(final_cols)
+            },
             "width": int(width),
             "height": int(height),
             "ratio": "9:16",
