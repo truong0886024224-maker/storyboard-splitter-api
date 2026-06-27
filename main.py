@@ -10,6 +10,33 @@ app = FastAPI()
 def home():
     return {"status": "ok", "message": "Storyboard Splitter API is running"}
 
+def make_9x16_full_hd(img, target_w=1080, target_h=1920):
+    h, w = img.shape[:2]
+
+    # Nền blur full 1080x1920
+    scale_bg = max(target_w / w, target_h / h)
+    bg_w = int(w * scale_bg)
+    bg_h = int(h * scale_bg)
+    bg = cv2.resize(img, (bg_w, bg_h), interpolation=cv2.INTER_CUBIC)
+
+    x = (bg_w - target_w) // 2
+    y = (bg_h - target_h) // 2
+    bg = bg[y:y+target_h, x:x+target_w]
+    bg = cv2.GaussianBlur(bg, (51, 51), 0)
+
+    # Ảnh chính giữ nguyên tỷ lệ, nằm giữa
+    scale_fg = min(target_w / w, target_h / h)
+    fg_w = int(w * scale_fg)
+    fg_h = int(h * scale_fg)
+    fg = cv2.resize(img, (fg_w, fg_h), interpolation=cv2.INTER_CUBIC)
+
+    canvas = bg.copy()
+    x1 = (target_w - fg_w) // 2
+    y1 = (target_h - fg_h) // 2
+    canvas[y1:y1+fg_h, x1:x1+fg_w] = fg
+
+    return canvas
+
 @app.post("/split-storyboard")
 async def split_storyboard(file: UploadFile = File(...)):
     contents = await file.read()
@@ -43,13 +70,17 @@ async def split_storyboard(file: UploadFile = File(...)):
             if crop.shape[0] > margin * 2 and crop.shape[1] > margin * 2:
                 crop = crop[margin:-margin, margin:-margin]
 
-            ok, buffer = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            final_img = make_9x16_full_hd(crop)
+
+            ok, buffer = cv2.imencode(".jpg", final_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
             if ok:
                 scenes.append({
                     "scene": index,
-                    "fileName": f"scene_{index:03}.jpg",
+                    "fileName": f"scene_{index:03}_9x16_1080x1920.jpg",
                     "mimeType": "image/jpeg",
+                    "width": 1080,
+                    "height": 1920,
                     "base64": base64.b64encode(buffer).decode("utf-8")
                 })
 
