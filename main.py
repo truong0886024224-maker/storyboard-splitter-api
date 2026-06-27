@@ -19,31 +19,23 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API Keep Original is running"
+        "message": "Storyboard Splitter API 9x16 Blur Background is running"
     }
 
 
 def fallback_grid(img, rows, cols):
     h, w = img.shape[:2]
     boxes = []
-
     cell_w = w // cols
     cell_h = h // rows
 
     for r in range(rows):
         for c in range(cols):
-            x1 = c * cell_w
-            y1 = r * cell_h
-            x2 = (c + 1) * cell_w if c < cols - 1 else w
-            y2 = (r + 1) * cell_h if r < rows - 1 else h
-
-            margin = 4
-            boxes.append((
-                max(0, x1 + margin),
-                max(0, y1 + margin),
-                min(w, x2 - margin),
-                min(h, y2 - margin)
-            ))
+            x1 = c * cell_w + 4
+            y1 = r * cell_h + 4
+            x2 = (c + 1) * cell_w - 4 if c < cols - 1 else w - 4
+            y2 = (r + 1) * cell_h - 4 if r < rows - 1 else h - 4
+            boxes.append((x1, y1, x2, y2))
 
     return boxes
 
@@ -51,7 +43,6 @@ def fallback_grid(img, rows, cols):
 def border_score(img, rows, cols):
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
     scores = []
 
     for c in range(1, cols):
@@ -68,37 +59,18 @@ def border_score(img, rows, cols):
 
 
 def choose_auto_layout(img):
-    h, w = img.shape[:2]
-    ratio = w / h
-
     candidates = [
-        (4, 2),
-        (3, 2),
-        (3, 3),
-        (4, 3),
-        (5, 2),
-        (2, 2),
-        (2, 3),
-        (5, 3),
+        (4, 2), (3, 2), (3, 3), (4, 3),
+        (5, 2), (2, 2), (2, 3), (5, 3)
     ]
 
-    best = None
+    best = (4, 2)
     best_score = -999
 
     for rows, cols in candidates:
         score = border_score(img, rows, cols)
-
-        expected_ratio = cols / rows
-        ratio_penalty = abs(ratio - expected_ratio) * 0.25
-
-        common_bonus = 0
-        if (rows, cols) in [(4, 2), (4, 3), (3, 3), (3, 2)]:
-            common_bonus = 0.08
-
-        final_score = score - ratio_penalty + common_bonus
-
-        if final_score > best_score:
-            best_score = final_score
+        if score > best_score:
+            best_score = score
             best = (rows, cols)
 
     return best
@@ -107,49 +79,54 @@ def choose_auto_layout(img):
 def detect_layout(img, rows=0, cols=0):
     if rows > 0 and cols > 0:
         return rows, cols
-
     return choose_auto_layout(img)
 
 
-def resize_keep_original(img, width=1080, height=1920, bg_mode="black"):
+def make_9x16_blur_background(img, width=1080, height=1920):
     h, w = img.shape[:2]
 
-    scale = min(width / w, height / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
+    # nền full 9:16 bằng ảnh phóng to + blur
+    scale_bg = max(width / w, height / h)
+    bg_w = int(w * scale_bg)
+    bg_h = int(h * scale_bg)
 
-    resized = cv2.resize(
-        img,
-        (new_w, new_h),
-        interpolation=cv2.INTER_LANCZOS4
-    )
+    bg = cv2.resize(img, (bg_w, bg_h), interpolation=cv2.INTER_CUBIC)
 
-    if bg_mode == "blur":
-        bg = cv2.resize(img, (width, height), interpolation=cv2.INTER_CUBIC)
-        canvas = cv2.GaussianBlur(bg, (0, 0), 30)
-    else:
-        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    x_bg = (bg_w - width) // 2
+    y_bg = (bg_h - height) // 2
+    bg = bg[y_bg:y_bg + height, x_bg:x_bg + width]
 
-    x = (width - new_w) // 2
-    y = (height - new_h) // 2
+    bg = cv2.GaussianBlur(bg, (0, 0), 32)
 
-    canvas[y:y + new_h, x:x + new_w] = resized
+    # làm nền tối nhẹ để ảnh chính nổi hơn
+    bg = cv2.addWeighted(bg, 0.75, np.zeros_like(bg), 0.25, 0)
 
-    blur = cv2.GaussianBlur(canvas, (0, 0), 1.0)
-    sharp = cv2.addWeighted(canvas, 1.25, blur, -0.25, 0)
+    # ảnh chính giữ nguyên tỉ lệ, không crop
+    scale_fg = min(width / w, height / h)
+    fg_w = int(w * scale_fg)
+    fg_h = int(h * scale_fg)
 
-    debug = {
-        "mode": "keep_original_no_crop",
-        "background": bg_mode,
+    fg = cv2.resize(img, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+
+    # sharpen ảnh chính
+    blur = cv2.GaussianBlur(fg, (0, 0), 1.0)
+    fg = cv2.addWeighted(fg, 1.45, blur, -0.45, 0)
+
+    x = (width - fg_w) // 2
+    y = (height - fg_h) // 2
+
+    canvas = bg.copy()
+    canvas[y:y + fg_h, x:x + fg_w] = fg
+
+    return canvas, {
+        "mode": "9x16_blur_background_keep_original",
         "original_width": int(w),
         "original_height": int(h),
-        "new_width": int(new_w),
-        "new_height": int(new_h),
+        "foreground_width": int(fg_w),
+        "foreground_height": int(fg_h),
         "x": int(x),
         "y": int(y)
     }
-
-    return sharp, debug
 
 
 @app.post("/split-storyboard")
@@ -158,20 +135,15 @@ async def split_storyboard(
     rows: int = Query(0),
     cols: int = Query(0),
     width: int = Query(1080),
-    height: int = Query(1920),
-    bg: str = Query("black")
+    height: int = Query(1920)
 ):
     try:
         contents = await file.read()
-
         arr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return JSONResponse(
-                {"error": "Cannot read image"},
-                status_code=400
-            )
+            return JSONResponse({"error": "Cannot read image"}, status_code=400)
 
         final_rows, final_cols = detect_layout(img, rows, cols)
         boxes = fallback_grid(img, final_rows, final_cols)
@@ -185,9 +157,9 @@ async def split_storyboard(
             if frame.size == 0:
                 continue
 
-            final_img, debug = resize_keep_original(frame, width, height, bg)
+            final_img, debug = make_9x16_blur_background(frame, width, height)
 
-            filename = f"{batch_id}_scene_{i:03}_keep_{width}x{height}.jpg"
+            filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
 
             cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 96])
@@ -222,15 +194,11 @@ async def split_storyboard(
             "width": int(width),
             "height": int(height),
             "ratio": "9:16",
-            "background": bg,
             "scenes": scenes
         }
 
     except Exception as e:
         return JSONResponse(
-            {
-                "error": "Internal Server Error",
-                "detail": str(e)
-            },
+            {"error": "Internal Server Error", "detail": str(e)},
             status_code=500
         )
