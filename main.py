@@ -5,7 +5,6 @@ import cv2
 import numpy as np
 import os
 import uuid
-import base64
 
 app = FastAPI()
 
@@ -20,7 +19,7 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API Pro Sharp is running"
+        "message": "Storyboard Splitter API Fast is running"
     }
 
 
@@ -142,8 +141,7 @@ def detect_storyboard_boxes(img, rows=0, cols=0):
         else:
             boxes = fallback_grid(img, 4, 2)
 
-    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-    return boxes
+    return sorted(boxes, key=lambda b: (b[1], b[0]))
 
 
 def crop_to_9x16(img):
@@ -155,69 +153,23 @@ def crop_to_9x16(img):
         new_w = int(h * target_ratio)
         x1 = max(0, (w - new_w) // 2)
         return img[:, x1:x1 + new_w]
-    else:
-        new_h = int(w / target_ratio)
-        y1 = max(0, (h - new_h) // 2)
-        return img[y1:y1 + new_h, :]
+
+    new_h = int(w / target_ratio)
+    y1 = max(0, (h - new_h) // 2)
+    return img[y1:y1 + new_h, :]
 
 
-def resize_and_sharpen(img, width=1080, height=1920):
+def resize_and_sharpen_fast(img, width=1080, height=1920):
     img = crop_to_9x16(img)
 
-    h, w = img.shape[:2]
-
-    # Upscale nhiều bước để đỡ vỡ hơn
-    if w < width or h < height:
-        scale1 = cv2.resize(
-            img,
-            (w * 2, h * 2),
-            interpolation=cv2.INTER_CUBIC
-        )
-    else:
-        scale1 = img
-
     resized = cv2.resize(
-        scale1,
+        img,
         (width, height),
         interpolation=cv2.INTER_LANCZOS4
     )
 
-    # Denoise nhẹ
-    denoise = cv2.fastNlMeansDenoisingColored(
-        resized,
-        None,
-        3,
-        3,
-        7,
-        21
-    )
-
-    # Tăng contrast nhẹ bằng CLAHE
-    lab = cv2.cvtColor(denoise, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
-    )
-
-    l = clahe.apply(l)
-
-    enhanced = cv2.merge((l, a, b))
-    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
-
-    # Sharpen mạnh hơn
-    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
-    sharp = cv2.addWeighted(enhanced, 1.65, blur, -0.65, 0)
-
-    # Làm nét cạnh nhẹ
-    kernel = np.array([
-        [0, -0.15, 0],
-        [-0.15, 1.6, -0.15],
-        [0, -0.15, 0]
-    ])
-
-    sharp = cv2.filter2D(sharp, -1, kernel)
+    blur = cv2.GaussianBlur(resized, (0, 0), 1.0)
+    sharp = cv2.addWeighted(resized, 1.45, blur, -0.45, 0)
 
     return sharp
 
@@ -252,18 +204,12 @@ async def split_storyboard(
         if crop.size == 0:
             continue
 
-        final_img = resize_and_sharpen(crop, width, height)
+        final_img = resize_and_sharpen_fast(crop, width, height)
 
         filename = f"{batch_id}_scene_{i:03}_9x16_{width}x{height}.jpg"
         path = os.path.join(OUTPUT_DIR, filename)
 
-        cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 98])
-
-        ok, buffer = cv2.imencode(
-            ".jpg",
-            final_img,
-            [cv2.IMWRITE_JPEG_QUALITY, 98]
-        )
+        cv2.imwrite(path, final_img, [cv2.IMWRITE_JPEG_QUALITY, 96])
 
         scenes.append({
             "scene": i,
@@ -273,7 +219,6 @@ async def split_storyboard(
             "height": height,
             "ratio": "9:16",
             "url": f"{BASE_URL}/files/{filename}",
-            "base64": base64.b64encode(buffer).decode("utf-8") if ok else None,
             "box": {
                 "x1": int(x1),
                 "y1": int(y1),
