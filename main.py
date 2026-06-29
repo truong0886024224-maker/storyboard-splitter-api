@@ -1,10 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
 from PIL import Image
 import os
 import uuid
-import zipfile
 import shutil
+import base64
+from io import BytesIO
 
 app = FastAPI()
 
@@ -13,27 +13,23 @@ def parse_row_layout(row_layout: str):
     try:
         layout = [int(x.strip()) for x in row_layout.split(",") if x.strip()]
     except Exception:
-        raise HTTPException(status_code=400, detail="row_layout sai. Ví dụ đúng: 3,3,3,2")
+        raise HTTPException(status_code=400, detail="row_layout sai. Ví dụ: 3,3,3,2")
 
     if not layout:
         raise HTTPException(status_code=400, detail="row_layout không được rỗng")
 
     if any(x <= 0 for x in layout):
-        raise HTTPException(status_code=400, detail="Số cột mỗi hàng phải lớn hơn 0")
+        raise HTTPException(status_code=400, detail="Mỗi hàng phải có số ảnh > 0")
 
     return layout
 
 
 def fit_to_9_16_no_crop(
     img: Image.Image,
-    target_width: int = 1080,
-    target_height: int = 1920,
+    target_width=1080,
+    target_height=1920,
     bg_color=(255, 255, 255)
 ):
-    """
-    Giữ toàn bộ chi tiết ảnh, không crop, không blur.
-    Ảnh chính được fit vào khung 9:16, phần dư là nền trắng.
-    """
     img = img.convert("RGB")
 
     src_w, src_h = img.size
@@ -54,25 +50,37 @@ def fit_to_9_16_no_crop(
     return canvas
 
 
-def crop_storyboard_by_row_layout(
+def image_to_base64(img: Image.Image, quality=100):
+    buffer = BytesIO()
+
+    img.save(
+        buffer,
+        format="JPEG",
+        quality=quality,
+        optimize=True,
+        progressive=True,
+        subsampling=0
+    )
+
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def split_storyboard(
     input_path: str,
-    output_dir: str,
     row_layout: list[int],
-    crop_margin: int = 0,
-    target_width: int = 1080,
-    target_height: int = 1920,
-    quality: int = 100,
+    crop_margin=0,
+    target_width=1080,
+    target_height=1920,
+    quality=100,
     bg_color=(255, 255, 255)
 ):
-    os.makedirs(output_dir, exist_ok=True)
-
     img = Image.open(input_path).convert("RGB")
     img_width, img_height = img.size
 
     rows = len(row_layout)
     row_height = img_height / rows
 
-    output_files = []
+    frames = []
     frame_index = 1
 
     for row_index, cols_in_row in enumerate(row_layout):
@@ -80,7 +88,6 @@ def crop_storyboard_by_row_layout(
         row_bottom = round((row_index + 1) * row_height)
 
         row_img = img.crop((0, row_top, img_width, row_bottom))
-
         col_width = img_width / cols_in_row
 
         for col_index in range(cols_in_row):
@@ -97,34 +104,27 @@ def crop_storyboard_by_row_layout(
 
             frame = row_img.crop((left, top, right, bottom))
 
-            frame_9_16 = fit_to_9_16_no_crop(
+            final_img = fit_to_9_16_no_crop(
                 frame,
                 target_width=target_width,
                 target_height=target_height,
                 bg_color=bg_color
             )
 
-            output_path = os.path.join(output_dir, f"frame_{frame_index:02d}.jpg")
+            filename = f"frame_{frame_index:02d}.jpg"
 
-            frame_9_16.save(
-                output_path,
-                "JPEG",
-                quality=quality,
-                optimize=True,
-                progressive=True,
-                subsampling=0
-            )
+            frames.append({
+                "index": frame_index,
+                "fileName": filename,
+                "mimeType": "image/jpeg",
+                "width": target_width,
+                "height": target_height,
+                "base64": image_to_base64(final_img, quality=quality)
+            })
 
-            output_files.append(output_path)
             frame_index += 1
 
-    return output_files
-
-
-def create_zip(files, zip_path):
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for file_path in files:
-            zipf.write(file_path, arcname=os.path.basename(file_path))
+    return frames
 
 
 @app.get("/")
@@ -132,42 +132,37 @@ def home():
     return {
         "status": "ok",
         "message": "Storyboard Splitter API is running",
-        "endpoint": "/crop"
+        "endpoint": "/crop-json"
     }
 
 
-@app.post("/crop")
-async def crop_image(
+@app.post("/crop-json")
+async def crop_json(
     file: UploadFile = File(...),
 
-    # Ví dụ ảnh 11 frame: 3 hàng đầu mỗi hàng 3 ảnh, hàng cuối 2 ảnh
+    # Ví dụ storyboard 11 ảnh: 3 + 3 + 3 + 2
     row_layout: str = Form("3,3,3,2"),
 
-    # Để 0 để không mất chi tiết. Nếu dính viền thì tăng 2-4.
+    # Để 0 để không mất chi tiết
     crop_margin: int = Form(0),
 
-    # Output chuẩn Shorts/Reels/TikTok
+    # Chuẩn 9:16
     target_width: int = Form(1080),
     target_height: int = Form(1920),
 
-    # Chất lượng ảnh
+    # Ảnh sắc nét
     quality: int = Form(100),
 
-    # Nền trắng. Nếu muốn nền đen đổi thành 0,0,0
+    # Nền trắng
     bg_r: int = Form(255),
     bg_g: int = Form(255),
     bg_b: int = Form(255),
 ):
     job_id = str(uuid.uuid4())
-
     work_dir = f"/tmp/{job_id}"
-    input_dir = os.path.join(work_dir, "input")
-    output_dir = os.path.join(work_dir, "frames")
-    zip_path = os.path.join(work_dir, "frames_9x16.zip")
+    os.makedirs(work_dir, exist_ok=True)
 
-    os.makedirs(input_dir, exist_ok=True)
-
-    input_path = os.path.join(input_dir, file.filename)
+    input_path = os.path.join(work_dir, file.filename)
 
     try:
         with open(input_path, "wb") as f:
@@ -175,9 +170,8 @@ async def crop_image(
 
         layout = parse_row_layout(row_layout)
 
-        files = crop_storyboard_by_row_layout(
+        frames = split_storyboard(
             input_path=input_path,
-            output_dir=output_dir,
             row_layout=layout,
             crop_margin=crop_margin,
             target_width=target_width,
@@ -186,14 +180,15 @@ async def crop_image(
             bg_color=(bg_r, bg_g, bg_b)
         )
 
-        create_zip(files, zip_path)
-
-        return FileResponse(
-            zip_path,
-            media_type="application/zip",
-            filename="frames_9x16.zip"
-        )
+        return {
+            "success": True,
+            "total": len(frames),
+            "row_layout": row_layout,
+            "frames": frames
+        }
 
     except Exception as e:
-        shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
