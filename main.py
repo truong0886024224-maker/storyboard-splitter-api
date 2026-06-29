@@ -21,7 +21,7 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter 9x16 - Trim White Border - No AI"
+        "message": "Storyboard Splitter 9x16 - Strong Trim White Border"
     }
 
 
@@ -39,9 +39,7 @@ def encode_base64(img, quality):
         img,
         [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
     )
-    if not ok:
-        return None
-    return base64.b64encode(buffer).decode("utf-8")
+    return base64.b64encode(buffer).decode("utf-8") if ok else None
 
 
 def find_white_runs(score, threshold=242, min_size=3):
@@ -71,7 +69,6 @@ def clean_runs(runs, min_gap=8):
 
     for s, e in runs[1:]:
         ps, pe = merged[-1]
-
         if s - pe <= min_gap:
             merged[-1] = (ps, e)
         else:
@@ -98,7 +95,6 @@ def detect_grid_lines(img, rows, cols):
     )
 
     x_edges = [0]
-
     for c in range(1, cols):
         expected = int(w * c / cols)
         candidates = []
@@ -117,7 +113,6 @@ def detect_grid_lines(img, rows, cols):
     x_edges.append(w)
 
     y_edges = [0]
-
     for r in range(1, rows):
         expected = int(h * r / rows)
         candidates = []
@@ -135,10 +130,7 @@ def detect_grid_lines(img, rows, cols):
 
     y_edges.append(h)
 
-    x_edges = sorted([int(x) for x in x_edges])
-    y_edges = sorted([int(y) for y in y_edges])
-
-    return x_edges, y_edges
+    return sorted([int(x) for x in x_edges]), sorted([int(y) for y in y_edges])
 
 
 def make_boxes_by_detected_lines(img, rows, cols, margin=0):
@@ -173,12 +165,10 @@ def make_boxes_by_detected_lines(img, rows, cols, margin=0):
     }
 
 
-def trim_white_border(panel, threshold=225, pad=0):
+def trim_white_border(panel, threshold=200, trim_pad=4):
     """
-    Xóa viền trắng trong panel.
-    threshold càng thấp thì xóa viền trắng càng mạnh.
-    Khuyên dùng 225.
-    Nếu còn viền: thử 215.
+    threshold thấp hơn = cắt viền trắng mạnh hơn.
+    trim_pad lớn hơn = ăn sâu vào trong thêm vài pixel.
     """
     gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
 
@@ -195,10 +185,16 @@ def trim_white_border(panel, threshold=225, pad=0):
 
     x, y, w, h = cv2.boundingRect(coords)
 
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(panel.shape[1], x + w + pad)
-    y2 = min(panel.shape[0], y + h + pad)
+    x1 = min(panel.shape[1] - 1, max(0, x + trim_pad))
+    y1 = min(panel.shape[0] - 1, max(0, y + trim_pad))
+    x2 = max(1, min(panel.shape[1], x + w - trim_pad))
+    y2 = max(1, min(panel.shape[0], y + h - trim_pad))
+
+    if x2 <= x1 or y2 <= y1:
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(panel.shape[1], x + w)
+        y2 = min(panel.shape[0], y + h)
 
     return panel[y1:y2, x1:x2], {
         "x1": int(x1),
@@ -225,7 +221,6 @@ def fit_to_9x16_canvas(panel, width=1080, height=1920, bg="black"):
     h, w = panel.shape[:2]
 
     scale = min(width / w, height / h)
-
     new_w = int(round(w * scale))
     new_h = int(round(h * scale))
 
@@ -266,6 +261,7 @@ async def split_storyboard(
     bg_q: Optional[str] = Query(None, alias="bg"),
     trim_panel_q: Optional[bool] = Query(None, alias="trim_panel"),
     trim_threshold_q: Optional[int] = Query(None, alias="trim_threshold"),
+    trim_pad_q: Optional[int] = Query(None, alias="trim_pad"),
 
     rows_f: Optional[int] = Form(None, alias="rows"),
     cols_f: Optional[int] = Form(None, alias="cols"),
@@ -278,11 +274,11 @@ async def split_storyboard(
     bg_f: Optional[str] = Form(None, alias="bg"),
     trim_panel_f: Optional[bool] = Form(None, alias="trim_panel"),
     trim_threshold_f: Optional[int] = Form(None, alias="trim_threshold"),
+    trim_pad_f: Optional[int] = Form(None, alias="trim_pad"),
 ):
     try:
         rows = int(pick(rows_f, rows_q, 5))
         cols = int(pick(cols_f, cols_q, 2))
-
         width = int(target_width_f or width_f or width_q or 1080)
         height = int(target_height_f or height_f or height_q or 1920)
 
@@ -291,20 +287,17 @@ async def split_storyboard(
         bg = str(pick(bg_f, bg_q, "black"))
 
         trim_panel = bool(pick(trim_panel_f, trim_panel_q, True))
-        trim_threshold = int(pick(trim_threshold_f, trim_threshold_q, 225))
+        trim_threshold = int(pick(trim_threshold_f, trim_threshold_q, 200))
+        trim_pad = int(pick(trim_pad_f, trim_pad_q, 4))
 
         contents = await file.read()
-
         img = cv2.imdecode(
             np.frombuffer(contents, np.uint8),
             cv2.IMREAD_COLOR
         )
 
         if img is None:
-            return JSONResponse(
-                {"error": "Cannot read image"},
-                status_code=400
-            )
+            return JSONResponse({"error": "Cannot read image"}, status_code=400)
 
         boxes, grid_debug = make_boxes_by_detected_lines(
             img,
@@ -317,10 +310,7 @@ async def split_storyboard(
         scenes = []
 
         for i, box in enumerate(boxes, start=1):
-            raw_panel = img[
-                box["y1"]:box["y2"],
-                box["x1"]:box["x2"]
-            ]
+            raw_panel = img[box["y1"]:box["y2"], box["x1"]:box["x2"]]
 
             if raw_panel.size == 0:
                 continue
@@ -329,7 +319,7 @@ async def split_storyboard(
                 panel, trim_box = trim_white_border(
                     raw_panel,
                     threshold=trim_threshold,
-                    pad=0
+                    trim_pad=trim_pad
                 )
             else:
                 panel = raw_panel
@@ -377,20 +367,18 @@ async def split_storyboard(
             "width": width,
             "height": height,
             "ratio": "9:16",
-            "mode": "detect_grid_trim_white_canvas_9x16",
+            "mode": "detect_grid_strong_trim_canvas_9x16",
             "ai": "disabled",
             "background": bg,
             "trim_panel": trim_panel,
             "trim_threshold": trim_threshold,
+            "trim_pad": trim_pad,
             "grid_debug": grid_debug,
             "scenes": scenes
         }
 
     except Exception as e:
         return JSONResponse(
-            {
-                "error": "Internal Server Error",
-                "detail": str(e)
-            },
+            {"error": "Internal Server Error", "detail": str(e)},
             status_code=500
         )
