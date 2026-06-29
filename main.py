@@ -1,35 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
 from PIL import Image
+import numpy as np
+import cv2
 import os
 import uuid
+import zipfile
 import shutil
-import base64
-from io import BytesIO
 
 app = FastAPI()
 
 
-def parse_row_layout(row_layout: str):
-    try:
-        layout = [int(x.strip()) for x in row_layout.split(",") if x.strip()]
-    except Exception:
-        raise HTTPException(status_code=400, detail="row_layout sai. Ví dụ: 3,3,3,2")
-
-    if not layout:
-        raise HTTPException(status_code=400, detail="row_layout không được rỗng")
-
-    if any(x <= 0 for x in layout):
-        raise HTTPException(status_code=400, detail="Mỗi hàng phải có số ảnh > 0")
-
-    return layout
-
-
-def fit_to_9_16_no_crop(
-    img: Image.Image,
-    target_width=1080,
-    target_height=1920,
-    bg_color=(255, 255, 255)
-):
+def fit_9_16_no_crop(img, target_width=1080, target_height=1920, bg_color=(255, 255, 255)):
     img = img.convert("RGB")
 
     src_w, src_h = img.size
@@ -46,149 +28,287 @@ def fit_to_9_16_no_crop(
     y = (target_height - new_h) // 2
 
     canvas.paste(resized, (x, y))
-
     return canvas
 
 
-def image_to_base64(img: Image.Image, quality=100):
-    buffer = BytesIO()
-
-    img.save(
-        buffer,
-        format="JPEG",
-        quality=quality,
-        optimize=True,
-        progressive=True,
-        subsampling=0
-    )
-
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+def smooth(arr, kernel_size=7):
+    kernel = np.ones(kernel_size) / kernel_size
+    return np.convolve(arr, kernel, mode="same")
 
 
-def split_storyboard(
-    input_path: str,
-    row_layout: list[int],
-    crop_margin=0,
-    target_width=1080,
-    target_height=1920,
-    quality=100,
-    bg_color=(255, 255, 255)
-):
-    img = Image.open(input_path).convert("RGB")
-    img_width, img_height = img.size
+def find_separator_bands(scores, threshold, min_size=1):
+    bands = []
+    in_band = False
+    start = 0
 
-    rows = len(row_layout)
-    row_height = img_height / rows
+    for i, value in enumerate(scores):
+        if value >= threshold and not in_band:
+            start = i
+            in_band = True
 
-    frames = []
-    frame_index = 1
+        if value < threshold and in_band:
+            end = i
+            if end - start >= min_size:
+                bands.append((start, end))
+            in_band = False
 
-    for row_index, cols_in_row in enumerate(row_layout):
-        row_top = round(row_index * row_height)
-        row_bottom = round((row_index + 1) * row_height)
+    if in_band:
+        end = len(scores)
+        if end - start >= min_size:
+            bands.append((start, end))
 
-        row_img = img.crop((0, row_top, img_width, row_bottom))
-        col_width = img_width / cols_in_row
+    return bands
 
-        for col_index in range(cols_in_row):
-            left = round(col_index * col_width) + crop_margin
-            right = round((col_index + 1) * col_width) - crop_margin
-            top = crop_margin
-            bottom = row_img.height - crop_margin
+
+def merge_bands(bands, max_gap=5):
+    if not bands:
+        return []
+
+    merged = [bands[0]]
+
+    for start, end in bands[1:]:
+        prev_start, prev_end = merged[-1]
+
+        if start - prev_end <= max_gap:
+            merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def remove_edge_bands(bands, size, edge_ratio=0.01):
+    edge = int(size * edge_ratio)
+    result = []
+
+    for start, end in bands:
+        center = (start + end) / 2
+
+        if center <= edge:
+            continue
+
+        if center >= size - edge:
+            continue
+
+        result.append((start, end))
+
+    return result
+
+
+def segments_from_bands(size, bands, min_size=40):
+    segments = []
+    current = 0
+
+    for start, end in bands:
+        if start - current >= min_size:
+            segments.append((current, start))
+        current = end
+
+    if size - current >= min_size:
+        segments.append((current, size))
+
+    return segments
+
+
+def trim_dark_border(pil_img, threshold=8):
+    arr = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    mask = gray > threshold
+
+    if not mask.any():
+        return pil_img
+
+    ys, xs = np.where(mask)
+
+    left = xs.min()
+    right = xs.max() + 1
+    top = ys.min()
+    bottom = ys.max() + 1
+
+    return pil_img.crop((left, top, right, bottom))
+
+
+def detect_horizontal_bands(gray, dark_threshold=35):
+    dark_mask = gray <= dark_threshold
+    scores = dark_mask.mean(axis=1)
+    scores = smooth(scores, 9)
+
+    threshold = max(0.35, np.percentile(scores, 92))
+
+    bands = find_separator_bands(scores, threshold, min_size=1)
+    bands = merge_bands(bands, max_gap=6)
+    bands = remove_edge_bands(bands, gray.shape[0], edge_ratio=0.01)
+
+    return bands
+
+
+def detect_vertical_bands(row_gray, dark_threshold=35):
+    dark_mask = row_gray <= dark_threshold
+    scores = dark_mask.mean(axis=0)
+    scores = smooth(scores, 7)
+
+    threshold = max(0.25, np.percentile(scores, 92))
+
+    bands = find_separator_bands(scores, threshold, min_size=1)
+    bands = merge_bands(bands, max_gap=6)
+    bands = remove_edge_bands(bands, row_gray.shape[1], edge_ratio=0.01)
+
+    return bands
+
+
+def detect_panels(input_path, dark_threshold=35, crop_margin=0):
+    pil_img = Image.open(input_path).convert("RGB")
+    arr = np.array(pil_img)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    img_h, img_w = gray.shape
+
+    horizontal_bands = detect_horizontal_bands(gray, dark_threshold)
+    row_segments = segments_from_bands(img_h, horizontal_bands, min_size=80)
+
+    panels = []
+
+    for row_top, row_bottom in row_segments:
+        row_gray = gray[row_top:row_bottom, :]
+
+        vertical_bands = detect_vertical_bands(row_gray, dark_threshold)
+        col_segments = segments_from_bands(img_w, vertical_bands, min_size=80)
+
+        for col_left, col_right in col_segments:
+            left = col_left + crop_margin
+            right = col_right - crop_margin
+            top = row_top + crop_margin
+            bottom = row_bottom - crop_margin
 
             if right <= left or bottom <= top:
-                raise HTTPException(
-                    status_code=400,
-                    detail="crop_margin quá lớn, ảnh bị cắt sai"
-                )
+                continue
 
-            frame = row_img.crop((left, top, right, bottom))
+            panel = pil_img.crop((left, top, right, bottom))
+            panel = trim_dark_border(panel)
 
-            final_img = fit_to_9_16_no_crop(
-                frame,
-                target_width=target_width,
-                target_height=target_height,
-                bg_color=bg_color
-            )
+            if panel.width < 80 or panel.height < 80:
+                continue
 
-            filename = f"frame_{frame_index:02d}.jpg"
+            panels.append(panel)
 
-            frames.append({
-                "index": frame_index,
-                "fileName": filename,
-                "mimeType": "image/jpeg",
-                "width": target_width,
-                "height": target_height,
-                "base64": image_to_base64(final_img, quality=quality)
-            })
+    return panels
 
-            frame_index += 1
 
-    return frames
+def save_frames_to_zip(
+    input_path,
+    output_dir,
+    target_width=1080,
+    target_height=1920,
+    quality=95,
+    crop_margin=0,
+    dark_threshold=35,
+    bg_color=(255, 255, 255)
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    panels = detect_panels(
+        input_path=input_path,
+        dark_threshold=dark_threshold,
+        crop_margin=crop_margin
+    )
+
+    if len(panels) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Không detect được panel nào. Thử dark_threshold = 50 hoặc 70."
+        )
+
+    output_files = []
+
+    for index, panel in enumerate(panels, start=1):
+        frame = fit_9_16_no_crop(
+            panel,
+            target_width=target_width,
+            target_height=target_height,
+            bg_color=bg_color
+        )
+
+        output_path = os.path.join(output_dir, f"frame_{index:02d}.jpg")
+
+        frame.save(
+            output_path,
+            "JPEG",
+            quality=quality,
+            optimize=True,
+            progressive=True,
+            subsampling=0
+        )
+
+        output_files.append(output_path)
+
+    return output_files
+
+
+def create_zip(files, zip_path):
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for file_path in files:
+            zipf.write(file_path, arcname=os.path.basename(file_path))
 
 
 @app.get("/")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter API is running",
-        "endpoint": "/crop-json"
+        "message": "Storyboard Splitter ZIP API is running",
+        "endpoint": "/crop"
     }
 
 
-@app.post("/crop-json")
-async def crop_json(
+@app.post("/crop")
+async def crop_zip(
     file: UploadFile = File(...),
-
-    # Ví dụ storyboard 11 ảnh: 3 + 3 + 3 + 2
-    row_layout: str = Form("3,3,3,2"),
-
-    # Để 0 để không mất chi tiết
-    crop_margin: int = Form(0),
-
-    # Chuẩn 9:16
     target_width: int = Form(1080),
     target_height: int = Form(1920),
-
-    # Ảnh sắc nét
-    quality: int = Form(100),
-
-    # Nền trắng
+    quality: int = Form(95),
+    crop_margin: int = Form(0),
+    dark_threshold: int = Form(35),
     bg_r: int = Form(255),
     bg_g: int = Form(255),
     bg_b: int = Form(255),
 ):
     job_id = str(uuid.uuid4())
-    work_dir = f"/tmp/{job_id}"
-    os.makedirs(work_dir, exist_ok=True)
 
-    input_path = os.path.join(work_dir, file.filename)
+    work_dir = f"/tmp/{job_id}"
+    input_dir = os.path.join(work_dir, "input")
+    output_dir = os.path.join(work_dir, "frames")
+    zip_path = os.path.join(work_dir, "frames_9x16.zip")
+
+    os.makedirs(input_dir, exist_ok=True)
+
+    input_path = os.path.join(input_dir, file.filename)
 
     try:
         with open(input_path, "wb") as f:
             f.write(await file.read())
 
-        layout = parse_row_layout(row_layout)
-
-        frames = split_storyboard(
+        files = save_frames_to_zip(
             input_path=input_path,
-            row_layout=layout,
-            crop_margin=crop_margin,
+            output_dir=output_dir,
             target_width=target_width,
             target_height=target_height,
             quality=quality,
+            crop_margin=crop_margin,
+            dark_threshold=dark_threshold,
             bg_color=(bg_r, bg_g, bg_b)
         )
 
-        return {
-            "success": True,
-            "total": len(frames),
-            "row_layout": row_layout,
-            "frames": frames
-        }
+        create_zip(files, zip_path)
+
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename="frames_9x16.zip",
+            headers={
+                "X-Total-Frames": str(len(files))
+            }
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e))
