@@ -1,181 +1,102 @@
-from fastapi import FastAPI, UploadFile, File, Query
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-import cv2
-import numpy as np
+from PIL import Image
 import os
-import uuid
-import base64
-
-app = FastAPI()
-
-OUTPUT_DIR = "files"
-BASE_URL = "https://storyboard-splitter-api.onrender.com"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
+import math
 
 
-@app.get("/")
-def home():
-    return {
-        "status": "ok",
-        "message": "Storyboard Splitter No AI - Keep Original"
-    }
+def crop_grid_image(
+    input_path,
+    output_dir="output_frames",
+    cols=3,
+    total_frames=None,
+    rows=None,
+    output_prefix="frame",
+    output_format="jpg"
+):
+    """
+    Cắt ảnh collage dạng lưới thành nhiều ảnh nhỏ.
 
+    input_path: đường dẫn ảnh gốc
+    output_dir: thư mục lưu ảnh sau khi cắt
+    cols: số cột cố định, ví dụ 3
+    total_frames: tổng số frame muốn lấy, ví dụ 11
+    rows: số hàng nếu biết trước. Nếu không truyền, sẽ tự tính từ total_frames
+    """
 
-def make_grid_boxes(img, rows, cols):
-    h, w = img.shape[:2]
-    boxes = []
+    os.makedirs(output_dir, exist_ok=True)
 
-    cell_w = w / cols
-    cell_h = h / rows
+    img = Image.open(input_path)
+    img_width, img_height = img.size
+
+    if rows is None:
+        if total_frames is None:
+            raise ValueError("Bạn cần truyền rows hoặc total_frames")
+        rows = math.ceil(total_frames / cols)
+
+    if total_frames is None:
+        total_frames = rows * cols
+
+    cell_width = img_width // cols
+    cell_height = img_height // rows
+
+    frame_index = 0
 
     for r in range(rows):
         for c in range(cols):
-            x1 = int(round(c * cell_w)) + 3
-            y1 = int(round(r * cell_h)) + 3
-            x2 = int(round((c + 1) * cell_w)) - 3
-            y2 = int(round((r + 1) * cell_h)) - 3
+            if frame_index >= total_frames:
+                break
 
-            boxes.append({
-                "x1": max(0, x1),
-                "y1": max(0, y1),
-                "x2": min(w, x2),
-                "y2": min(h, y2)
-            })
+            left = c * cell_width
+            top = r * cell_height
 
-    return boxes
+            right = left + cell_width
+            bottom = top + cell_height
 
+            # tránh bị thiếu pixel ở cột/hàng cuối do chia dư
+            if c == cols - 1:
+                right = img_width
+            if r == rows - 1:
+                bottom = img_height
 
-def make_9x16_no_ai(img, width=1080, height=1920, bg="black"):
-    h, w = img.shape[:2]
+            cropped = img.crop((left, top, right, bottom))
 
-    scale = min(width / w, height / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-
-    resized = cv2.resize(
-        img,
-        (new_w, new_h),
-        interpolation=cv2.INTER_LANCZOS4
-    )
-
-    if bg == "white":
-        canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
-    elif bg == "average":
-        avg_color = np.mean(img.reshape(-1, 3), axis=0).astype(np.uint8)
-        canvas = np.zeros((height, width, 3), dtype=np.uint8)
-        canvas[:] = avg_color
-    else:
-        canvas = np.zeros((height, width, 3), dtype=np.uint8)
-
-    x = (width - new_w) // 2
-    y = (height - new_h) // 2
-
-    canvas[y:y + new_h, x:x + new_w] = resized
-
-    # sharpen nhẹ, không vẽ thêm
-    blur = cv2.GaussianBlur(canvas, (0, 0), 1.0)
-    sharp = cv2.addWeighted(canvas, 1.25, blur, -0.25, 0)
-
-    return sharp
-
-
-def encode_base64(img, quality=96):
-    ok, buffer = cv2.imencode(
-        ".jpg",
-        img,
-        [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
-    )
-
-    if not ok:
-        return None
-
-    return base64.b64encode(buffer).decode("utf-8")
-
-
-@app.post("/split-storyboard")
-async def split_storyboard(
-    file: UploadFile = File(...),
-    rows: int = Query(4),
-    cols: int = Query(2),
-    width: int = Query(1080),
-    height: int = Query(1920),
-    bg: str = Query("black"),
-    quality: int = Query(96)
-):
-    try:
-        contents = await file.read()
-        arr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-        if img is None:
-            return JSONResponse(
-                {"error": "Cannot read image"},
-                status_code=400
+            output_path = os.path.join(
+                output_dir,
+                f"{output_prefix}_{frame_index + 1:02d}.{output_format}"
             )
 
-        boxes = make_grid_boxes(img, rows, cols)
-        batch_id = str(uuid.uuid4())[:8]
+            if output_format.lower() in ["jpg", "jpeg"]:
+                cropped = cropped.convert("RGB")
+                cropped.save(output_path, quality=95)
+            else:
+                cropped.save(output_path)
 
-        scenes = []
+            print(f"Saved: {output_path}")
 
-        for i, box in enumerate(boxes, start=1):
-            x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+            frame_index += 1
 
-            crop = img[y1:y2, x1:x2]
+    print(f"Done. Total frames: {frame_index}")
 
-            if crop.size == 0:
-                continue
 
-            final_img = make_9x16_no_ai(
-                crop,
-                width=width,
-                height=height,
-                bg=bg
-            )
+# =========================
+# CÁCH DÙNG
+# =========================
 
-            filename = f"{batch_id}_scene_{i:03}_9x16_no_ai.jpg"
-            path = os.path.join(OUTPUT_DIR, filename)
+# Ví dụ 1:
+# Ảnh có 3 cột, tổng 11 frame.
+# Code tự tính số hàng = ceil(11 / 3) = 4
+crop_grid_image(
+    input_path="grid.jpg",
+    output_dir="frames",
+    cols=3,
+    total_frames=11
+)
 
-            cv2.imwrite(
-                path,
-                final_img,
-                [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
-            )
 
-            image_base64 = encode_base64(final_img, quality)
-
-            scenes.append({
-                "scene": int(i),
-                "fileName": filename,
-                "mimeType": "image/jpeg",
-                "width": int(width),
-                "height": int(height),
-                "ratio": "9:16",
-                "url": f"{BASE_URL}/files/{filename}",
-                "base64": image_base64,
-                "storyboard_box": box
-            })
-
-        return {
-            "total": len(scenes),
-            "rows": int(rows),
-            "cols": int(cols),
-            "width": int(width),
-            "height": int(height),
-            "ratio": "9:16",
-            "background": bg,
-            "ai": "disabled",
-            "scenes": scenes
-        }
-
-    except Exception as e:
-        return JSONResponse(
-            {
-                "error": "Internal Server Error",
-                "detail": str(e)
-            },
-            status_code=500
-        )
+# Ví dụ 2:
+# Nếu biết chắc ảnh là 3 cột x 4 hàng
+# crop_grid_image(
+#     input_path="grid.jpg",
+#     output_dir="frames",
+#     cols=3,
+#     rows=4
+# )
