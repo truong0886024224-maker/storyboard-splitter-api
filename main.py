@@ -1,314 +1,257 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
-from PIL import Image
-import numpy as np
+from fastapi import FastAPI, UploadFile, File, Query
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 import cv2
+import numpy as np
 import os
 import uuid
-import zipfile
-import shutil
 
 app = FastAPI()
 
-
-def fit_9_16_no_crop(img, target_width=1080, target_height=1920, bg_color=(255, 255, 255)):
-    img = img.convert("RGB")
-
-    src_w, src_h = img.size
-    scale = min(target_width / src_w, target_height / src_h)
-
-    new_w = int(src_w * scale)
-    new_h = int(src_h * scale)
-
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
-
-    canvas = Image.new("RGB", (target_width, target_height), bg_color)
-
-    x = (target_width - new_w) // 2
-    y = (target_height - new_h) // 2
-
-    canvas.paste(resized, (x, y))
-    return canvas
-
-
-def smooth(arr, kernel_size=7):
-    kernel = np.ones(kernel_size) / kernel_size
-    return np.convolve(arr, kernel, mode="same")
-
-
-def find_separator_bands(scores, threshold, min_size=1):
-    bands = []
-    in_band = False
-    start = 0
-
-    for i, value in enumerate(scores):
-        if value >= threshold and not in_band:
-            start = i
-            in_band = True
-
-        if value < threshold and in_band:
-            end = i
-            if end - start >= min_size:
-                bands.append((start, end))
-            in_band = False
-
-    if in_band:
-        end = len(scores)
-        if end - start >= min_size:
-            bands.append((start, end))
-
-    return bands
-
-
-def merge_bands(bands, max_gap=5):
-    if not bands:
-        return []
-
-    merged = [bands[0]]
-
-    for start, end in bands[1:]:
-        prev_start, prev_end = merged[-1]
-
-        if start - prev_end <= max_gap:
-            merged[-1] = (prev_start, end)
-        else:
-            merged.append((start, end))
-
-    return merged
-
-
-def remove_edge_bands(bands, size, edge_ratio=0.01):
-    edge = int(size * edge_ratio)
-    result = []
-
-    for start, end in bands:
-        center = (start + end) / 2
-
-        if center <= edge:
-            continue
-
-        if center >= size - edge:
-            continue
-
-        result.append((start, end))
-
-    return result
-
-
-def segments_from_bands(size, bands, min_size=40):
-    segments = []
-    current = 0
-
-    for start, end in bands:
-        if start - current >= min_size:
-            segments.append((current, start))
-        current = end
-
-    if size - current >= min_size:
-        segments.append((current, size))
-
-    return segments
-
-
-def trim_dark_border(pil_img, threshold=8):
-    arr = np.array(pil_img.convert("RGB"))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-
-    mask = gray > threshold
-
-    if not mask.any():
-        return pil_img
-
-    ys, xs = np.where(mask)
-
-    left = xs.min()
-    right = xs.max() + 1
-    top = ys.min()
-    bottom = ys.max() + 1
-
-    return pil_img.crop((left, top, right, bottom))
-
-
-def detect_horizontal_bands(gray, dark_threshold=35):
-    dark_mask = gray <= dark_threshold
-    scores = dark_mask.mean(axis=1)
-    scores = smooth(scores, 9)
-
-    threshold = max(0.35, np.percentile(scores, 92))
-
-    bands = find_separator_bands(scores, threshold, min_size=1)
-    bands = merge_bands(bands, max_gap=6)
-    bands = remove_edge_bands(bands, gray.shape[0], edge_ratio=0.01)
-
-    return bands
-
-
-def detect_vertical_bands(row_gray, dark_threshold=35):
-    dark_mask = row_gray <= dark_threshold
-    scores = dark_mask.mean(axis=0)
-    scores = smooth(scores, 7)
-
-    threshold = max(0.25, np.percentile(scores, 92))
-
-    bands = find_separator_bands(scores, threshold, min_size=1)
-    bands = merge_bands(bands, max_gap=6)
-    bands = remove_edge_bands(bands, row_gray.shape[1], edge_ratio=0.01)
-
-    return bands
-
-
-def detect_panels(input_path, dark_threshold=35, crop_margin=0):
-    pil_img = Image.open(input_path).convert("RGB")
-    arr = np.array(pil_img)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-
-    img_h, img_w = gray.shape
-
-    horizontal_bands = detect_horizontal_bands(gray, dark_threshold)
-    row_segments = segments_from_bands(img_h, horizontal_bands, min_size=80)
-
-    panels = []
-
-    for row_top, row_bottom in row_segments:
-        row_gray = gray[row_top:row_bottom, :]
-
-        vertical_bands = detect_vertical_bands(row_gray, dark_threshold)
-        col_segments = segments_from_bands(img_w, vertical_bands, min_size=80)
-
-        for col_left, col_right in col_segments:
-            left = col_left + crop_margin
-            right = col_right - crop_margin
-            top = row_top + crop_margin
-            bottom = row_bottom - crop_margin
-
-            if right <= left or bottom <= top:
-                continue
-
-            panel = pil_img.crop((left, top, right, bottom))
-            panel = trim_dark_border(panel)
-
-            if panel.width < 80 or panel.height < 80:
-                continue
-
-            panels.append(panel)
-
-    return panels
-
-
-def save_frames_to_zip(
-    input_path,
-    output_dir,
-    target_width=1080,
-    target_height=1920,
-    quality=95,
-    crop_margin=0,
-    dark_threshold=35,
-    bg_color=(255, 255, 255)
-):
-    os.makedirs(output_dir, exist_ok=True)
-
-    panels = detect_panels(
-        input_path=input_path,
-        dark_threshold=dark_threshold,
-        crop_margin=crop_margin
-    )
-
-    if len(panels) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Không detect được panel nào. Thử dark_threshold = 50 hoặc 70."
-        )
-
-    output_files = []
-
-    for index, panel in enumerate(panels, start=1):
-        frame = fit_9_16_no_crop(
-            panel,
-            target_width=target_width,
-            target_height=target_height,
-            bg_color=bg_color
-        )
-
-        output_path = os.path.join(output_dir, f"frame_{index:02d}.jpg")
-
-        frame.save(
-            output_path,
-            "JPEG",
-            quality=quality,
-            optimize=True,
-            progressive=True,
-            subsampling=0
-        )
-
-        output_files.append(output_path)
-
-    return output_files
-
-
-def create_zip(files, zip_path):
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for file_path in files:
-            zipf.write(file_path, arcname=os.path.basename(file_path))
+OUTPUT_DIR = "files"
+BASE_URL = "https://storyboard-splitter-api.onrender.com"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 
 @app.get("/")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter ZIP API is running",
-        "endpoint": "/crop"
+        "message": "Storyboard Splitter 9x16 No AI"
     }
 
 
-@app.post("/crop")
-async def crop_zip(
+def make_grid_boxes(img, rows, cols):
+    h, w = img.shape[:2]
+    boxes = []
+
+    cell_w = w / cols
+    cell_h = h / rows
+
+    for r in range(rows):
+        for c in range(cols):
+            x1 = int(round(c * cell_w)) + 4
+            y1 = int(round(r * cell_h)) + 4
+            x2 = int(round((c + 1) * cell_w)) - 4
+            y2 = int(round((r + 1) * cell_h)) - 4
+
+            boxes.append((
+                max(0, x1),
+                max(0, y1),
+                min(w, x2),
+                min(h, y2)
+            ))
+
+    return boxes
+
+
+def border_score(img, rows, cols):
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    scores = []
+
+    for c in range(1, cols):
+        x = int(w * c / cols)
+        band = gray[:, max(0, x - 5):min(w, x + 5)]
+        scores.append(float(np.mean(band > 225)))
+
+    for r in range(1, rows):
+        y = int(h * r / rows)
+        band = gray[max(0, y - 5):min(h, y + 5), :]
+        scores.append(float(np.mean(band > 225)))
+
+    return float(np.mean(scores)) if scores else 0
+
+
+def choose_auto_layout(img):
+    candidates = [
+        (4, 2),
+        (3, 2),
+        (3, 3),
+        (4, 3),
+        (5, 2),
+        (2, 2),
+        (2, 3),
+        (5, 3),
+    ]
+
+    best = (4, 2)
+    best_score = -999
+
+    for rows, cols in candidates:
+        score = border_score(img, rows, cols)
+
+        if score > best_score:
+            best_score = score
+            best = (rows, cols)
+
+    return best
+
+
+def detect_layout(img, rows, cols):
+    if rows > 0 and cols > 0:
+        return rows, cols
+
+    return choose_auto_layout(img)
+
+
+def sharpen(img):
+    blur = cv2.GaussianBlur(img, (0, 0), 1.0)
+    return cv2.addWeighted(img, 1.25, blur, -0.25, 0)
+
+
+def get_edge_background_color(img):
+    h, w = img.shape[:2]
+
+    top = img[0:max(2, h // 10), :, :]
+    bottom = img[max(0, h - h // 10):h, :, :]
+    left = img[:, 0:max(2, w // 10), :]
+    right = img[:, max(0, w - w // 10):w, :]
+
+    samples = np.concatenate([
+        top.reshape(-1, 3),
+        bottom.reshape(-1, 3),
+        left.reshape(-1, 3),
+        right.reshape(-1, 3),
+    ], axis=0)
+
+    return np.mean(samples, axis=0).astype(np.uint8)
+
+
+def convert_to_9x16_no_ai(img, width=1080, height=1920, bg="edge"):
+    h, w = img.shape[:2]
+
+    scale = min(width / w, height / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    resized = cv2.resize(
+        img,
+        (new_w, new_h),
+        interpolation=cv2.INTER_LANCZOS4
+    )
+
+    resized = sharpen(resized)
+
+    if bg == "white":
+        canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
+    elif bg == "black":
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    else:
+        color = get_edge_background_color(img)
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        canvas[:] = color
+
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
+
+    canvas[y:y + new_h, x:x + new_w] = resized
+
+    return canvas, {
+        "mode": "no_ai_keep_original",
+        "background": bg,
+        "original_width": int(w),
+        "original_height": int(h),
+        "final_width": int(width),
+        "final_height": int(height),
+        "placed_width": int(new_w),
+        "placed_height": int(new_h),
+        "x": int(x),
+        "y": int(y)
+    }
+
+
+@app.post("/split-storyboard")
+async def split_storyboard(
     file: UploadFile = File(...),
-    target_width: int = Form(1080),
-    target_height: int = Form(1920),
-    quality: int = Form(95),
-    crop_margin: int = Form(0),
-    dark_threshold: int = Form(35),
-    bg_r: int = Form(255),
-    bg_g: int = Form(255),
-    bg_b: int = Form(255),
+    rows: int = Query(0),
+    cols: int = Query(0),
+    width: int = Query(1080),
+    height: int = Query(1920),
+    bg: str = Query("edge"),
+    quality: int = Query(96)
 ):
-    job_id = str(uuid.uuid4())
-
-    work_dir = f"/tmp/{job_id}"
-    input_dir = os.path.join(work_dir, "input")
-    output_dir = os.path.join(work_dir, "frames")
-    zip_path = os.path.join(work_dir, "frames_9x16.zip")
-
-    os.makedirs(input_dir, exist_ok=True)
-
-    input_path = os.path.join(input_dir, file.filename)
-
     try:
-        with open(input_path, "wb") as f:
-            f.write(await file.read())
+        contents = await file.read()
+        arr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-        files = save_frames_to_zip(
-            input_path=input_path,
-            output_dir=output_dir,
-            target_width=target_width,
-            target_height=target_height,
-            quality=quality,
-            crop_margin=crop_margin,
-            dark_threshold=dark_threshold,
-            bg_color=(bg_r, bg_g, bg_b)
-        )
+        if img is None:
+            return JSONResponse(
+                {"error": "Cannot read image"},
+                status_code=400
+            )
 
-        create_zip(files, zip_path)
+        final_rows, final_cols = detect_layout(img, rows, cols)
+        boxes = make_grid_boxes(img, final_rows, final_cols)
 
-        return FileResponse(
-            zip_path,
-            media_type="application/zip",
-            filename="frames_9x16.zip",
-            headers={
-                "X-Total-Frames": str(len(files))
-            }
-        )
+        batch_id = str(uuid.uuid4())[:8]
+        scenes = []
+
+        for i, (x1, y1, x2, y2) in enumerate(boxes, start=1):
+            frame = img[y1:y2, x1:x2]
+
+            if frame.size == 0:
+                continue
+
+            final_img, debug = convert_to_9x16_no_ai(
+                frame,
+                width=width,
+                height=height,
+                bg=bg
+            )
+
+            filename = f"{batch_id}_scene_{i:03}_9x16.jpg"
+            path = os.path.join(OUTPUT_DIR, filename)
+
+            cv2.imwrite(
+                path,
+                final_img,
+                [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
+            )
+
+            scenes.append({
+                "scene": int(i),
+                "fileName": filename,
+                "mimeType": "image/jpeg",
+                "width": int(width),
+                "height": int(height),
+                "ratio": "9:16",
+                "url": f"{BASE_URL}/files/{filename}",
+                "layout": {
+                    "rows": int(final_rows),
+                    "cols": int(final_cols)
+                },
+                "storyboard_box": {
+                    "x1": int(x1),
+                    "y1": int(y1),
+                    "x2": int(x2),
+                    "y2": int(y2)
+                },
+                "resize": debug
+            })
+
+        return {
+            "total": len(scenes),
+            "layout": {
+                "rows": int(final_rows),
+                "cols": int(final_cols)
+            },
+            "width": int(width),
+            "height": int(height),
+            "ratio": "9:16",
+            "ai": "disabled",
+            "background": bg,
+            "scenes": scenes
+        }
 
     except Exception as e:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(
+            {
+                "error": "Internal Server Error",
+                "detail": str(e)
+            },
+            status_code=500
+        )
