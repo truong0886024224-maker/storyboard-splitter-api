@@ -19,14 +19,13 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 def home():
     return {
         "status": "ok",
-        "message": "Storyboard Splitter Exact Full 9x16"
+        "message": "Storyboard Splitter Keep Full 9x16 No Crop"
     }
 
 
 def make_grid_boxes(img, rows, cols, margin=0):
     h, w = img.shape[:2]
     boxes = []
-
     cell_w = w / cols
     cell_h = h / rows
 
@@ -41,68 +40,67 @@ def make_grid_boxes(img, rows, cols, margin=0):
                 "x1": max(0, x1),
                 "y1": max(0, y1),
                 "x2": min(w, x2),
-                "y2": min(h, y2)
+                "y2": min(h, y2),
             })
 
     return boxes
 
 
-def crop_to_9x16_full(img, crop_position="center"):
-    h, w = img.shape[:2]
-    target_ratio = 9 / 16
-    current_ratio = w / h
+def make_background(panel, width, height, bg):
+    if bg == "white":
+        return np.ones((height, width, 3), dtype=np.uint8) * 255
 
-    if current_ratio > target_ratio:
-        # Ảnh quá ngang → cắt 2 bên
-        new_w = int(h * target_ratio)
+    if bg == "black":
+        return np.zeros((height, width, 3), dtype=np.uint8)
 
-        if crop_position == "left":
-            x1 = 0
-        elif crop_position == "right":
-            x1 = w - new_w
-        else:
-            x1 = (w - new_w) // 2
+    h, w = panel.shape[:2]
+    edges = np.concatenate([
+        panel[:max(2, h // 12), :, :].reshape(-1, 3),
+        panel[max(0, h - h // 12):, :, :].reshape(-1, 3),
+        panel[:, :max(2, w // 12), :].reshape(-1, 3),
+        panel[:, max(0, w - w // 12):, :].reshape(-1, 3),
+    ], axis=0)
 
-        x2 = x1 + new_w
-        y1 = 0
-        y2 = h
-
-    else:
-        # Ảnh quá dọc → cắt trên dưới
-        new_h = int(w / target_ratio)
-
-        if crop_position == "top":
-            y1 = 0
-        elif crop_position == "bottom":
-            y1 = h - new_h
-        else:
-            y1 = (h - new_h) // 2
-
-        y2 = y1 + new_h
-        x1 = 0
-        x2 = w
-
-    cropped = img[y1:y2, x1:x2]
-
-    return cropped, {
-        "x1": int(x1),
-        "y1": int(y1),
-        "x2": int(x2),
-        "y2": int(y2)
-    }
+    color = np.mean(edges, axis=0).astype(np.uint8)
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:] = color
+    return canvas
 
 
-def resize_sharp(img, width=1080, height=1920):
+def fit_full_to_9x16(panel, width=1080, height=1920, bg="black"):
+    h, w = panel.shape[:2]
+
+    scale = min(width / w, height / h)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+
     resized = cv2.resize(
-        img,
-        (width, height),
+        panel,
+        (new_w, new_h),
         interpolation=cv2.INTER_LANCZOS4
     )
 
-    blur = cv2.GaussianBlur(resized, (0, 0), 0.8)
-    sharp = cv2.addWeighted(resized, 1.18, blur, -0.18, 0)
+    canvas = make_background(panel, width, height, bg)
 
-    return sharp
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
+
+    canvas[y:y + new_h, x:x + new_w] = resized
+
+    # sharpen nhẹ, không vẽ thêm, không crop
+    blur = cv2.GaussianBlur(canvas, (0, 0), 0.8)
+    final_img = cv2.addWeighted(canvas, 1.18, blur, -0.18, 0)
+
+    return final_img, {
+        "mode": "keep_full_no_crop",
+        "background": bg,
+        "original_width": int(w),
+        "original_height": int(h),
+        "placed_width": int(new_w),
+        "placed_height": int(new_h),
+        "x": int(x),
+        "y": int(y)
+    }
 
 
 @app.post("/split-storyboard")
@@ -114,7 +112,7 @@ async def split_storyboard(
     height: int = Query(1920),
     margin: int = Query(0),
     quality: int = Query(96),
-    crop_position: str = Query("center")
+    bg: str = Query("black")
 ):
     try:
         contents = await file.read()
@@ -122,37 +120,26 @@ async def split_storyboard(
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return JSONResponse(
-                {"error": "Cannot read image"},
-                status_code=400
-            )
+            return JSONResponse({"error": "Cannot read image"}, status_code=400)
 
         boxes = make_grid_boxes(img, rows, cols, margin)
-
         batch_id = str(uuid.uuid4())[:8]
         scenes = []
 
         for i, box in enumerate(boxes, start=1):
-            panel = img[
-                box["y1"]:box["y2"],
-                box["x1"]:box["x2"]
-            ]
+            panel = img[box["y1"]:box["y2"], box["x1"]:box["x2"]]
 
             if panel.size == 0:
                 continue
 
-            crop_9x16, crop_box = crop_to_9x16_full(
+            final_img, debug = fit_full_to_9x16(
                 panel,
-                crop_position=crop_position
-            )
-
-            final_img = resize_sharp(
-                crop_9x16,
                 width=width,
-                height=height
+                height=height,
+                bg=bg
             )
 
-            filename = f"{batch_id}_scene_{i:03}_full_9x16.jpg"
+            filename = f"{batch_id}_scene_{i:03}_keep_full_9x16.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
 
             cv2.imwrite(
@@ -169,13 +156,8 @@ async def split_storyboard(
                 "height": int(height),
                 "ratio": "9:16",
                 "url": f"{BASE_URL}/files/{filename}",
-                "layout": {
-                    "rows": int(rows),
-                    "cols": int(cols)
-                },
                 "storyboard_box": box,
-                "crop_9x16_box_inside_panel": crop_box,
-                "crop_position": crop_position
+                "resize": debug
             })
 
         return {
@@ -185,16 +167,14 @@ async def split_storyboard(
             "width": int(width),
             "height": int(height),
             "ratio": "9:16",
-            "mode": "full_9x16_crop_no_border",
+            "mode": "keep_full_no_crop",
             "ai": "disabled",
+            "background": bg,
             "scenes": scenes
         }
 
     except Exception as e:
         return JSONResponse(
-            {
-                "error": "Internal Server Error",
-                "detail": str(e)
-            },
+            {"error": "Internal Server Error", "detail": str(e)},
             status_code=500
         )
