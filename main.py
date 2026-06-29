@@ -1,150 +1,66 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
-from PIL import Image
+from PIL import Image, ImageFilter
 import os
-import math
 import uuid
 import zipfile
 import shutil
-import numpy as np
 
 app = FastAPI()
 
 
-def merge_lines(lines, min_distance):
-    merged = []
+def make_9_16_crop(img, target_width=1080, target_height=1920):
+    src_w, src_h = img.size
+    target_ratio = target_width / target_height
+    src_ratio = src_w / src_h
 
-    for line in lines:
-        if not merged or abs(line - merged[-1]) > min_distance:
-            merged.append(line)
+    if src_ratio > target_ratio:
+        new_w = int(src_h * target_ratio)
+        left = (src_w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, src_h))
+    else:
+        new_h = int(src_w / target_ratio)
+        top = (src_h - new_h) // 2
+        img = img.crop((0, top, src_w, top + new_h))
 
-    return merged
+    return img.resize((target_width, target_height), Image.LANCZOS)
 
 
-def detect_grid(input_path):
-    img = Image.open(input_path).convert("RGB")
-    arr = np.array(img)
+def make_9_16_padding(img, target_width=1080, target_height=1920):
+    bg = img.resize((target_width, target_height), Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(35))
 
-    height, width, _ = arr.shape
+    src_w, src_h = img.size
+    scale = min(target_width / src_w, target_height / src_h)
 
-    col_scores = []
-    for x in range(width):
-        col_scores.append(np.std(arr[:, x, :]))
+    new_w = int(src_w * scale)
+    new_h = int(src_h * scale)
 
-    threshold_col = np.percentile(col_scores, 8)
+    foreground = img.resize((new_w, new_h), Image.LANCZOS)
 
-    vertical_lines = []
-    in_line = False
-    start = 0
+    x = (target_width - new_w) // 2
+    y = (target_height - new_h) // 2
 
-    for i, score in enumerate(col_scores):
-        if score <= threshold_col:
-            if not in_line:
-                start = i
-                in_line = True
-        else:
-            if in_line:
-                end = i
-                if end - start > 2:
-                    vertical_lines.append((start + end) // 2)
-                in_line = False
-
-    vertical_lines = [
-        x for x in vertical_lines
-        if width * 0.05 < x < width * 0.95
-    ]
-
-    vertical_lines = merge_lines(
-        vertical_lines,
-        min_distance=int(width * 0.05)
-    )
-
-    row_scores = []
-    for y in range(height):
-        row_scores.append(np.std(arr[y, :, :]))
-
-    threshold_row = np.percentile(row_scores, 8)
-
-    horizontal_lines = []
-    in_line = False
-    start = 0
-
-    for i, score in enumerate(row_scores):
-        if score <= threshold_row:
-            if not in_line:
-                start = i
-                in_line = True
-        else:
-            if in_line:
-                end = i
-                if end - start > 2:
-                    horizontal_lines.append((start + end) // 2)
-                in_line = False
-
-    horizontal_lines = [
-        y for y in horizontal_lines
-        if height * 0.05 < y < height * 0.95
-    ]
-
-    horizontal_lines = merge_lines(
-        horizontal_lines,
-        min_distance=int(height * 0.05)
-    )
-
-    cols = len(vertical_lines) + 1
-    rows = len(horizontal_lines) + 1
-
-    if cols < 1:
-        cols = 1
-
-    if rows < 1:
-        rows = 1
-
-    return cols, rows
+    bg.paste(foreground, (x, y))
+    return bg
 
 
 def crop_grid_image(
     input_path,
     output_dir,
-    cols=None,
-    rows=None,
-    total_frames=None,
-    auto_detect=True
+    cols=3,
+    rows=4,
+    total_frames=11,
+    crop_margin=0,
+    fit_mode="crop"
 ):
     os.makedirs(output_dir, exist_ok=True)
 
     img = Image.open(input_path).convert("RGB")
     img_width, img_height = img.size
 
-    if auto_detect and (cols is None or rows is None):
-        detected_cols, detected_rows = detect_grid(input_path)
-
-        if cols is None:
-            cols = detected_cols
-
-        if rows is None:
-            rows = detected_rows
-
-    if cols is None:
-        cols = 3
-
-    if rows is None:
-        if total_frames:
-            rows = math.ceil(total_frames / cols)
-        else:
-            rows = 1
-
-    if total_frames is None:
-        total_frames = cols * rows
-
-    if cols <= 0 or rows <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="cols và rows phải lớn hơn 0"
-        )
-
-    cell_width = img_width // cols
-    cell_height = img_height // rows
+    cell_width = img_width / cols
+    cell_height = img_height / rows
 
     output_files = []
     frame_index = 0
@@ -154,12 +70,20 @@ def crop_grid_image(
             if frame_index >= total_frames:
                 break
 
-            left = c * cell_width
-            top = r * cell_height
-            right = img_width if c == cols - 1 else left + cell_width
-            bottom = img_height if r == rows - 1 else top + cell_height
+            left = round(c * cell_width) + crop_margin
+            top = round(r * cell_height) + crop_margin
+            right = round((c + 1) * cell_width) - crop_margin
+            bottom = round((r + 1) * cell_height) - crop_margin
+
+            if right <= left or bottom <= top:
+                raise ValueError("crop_margin quá lớn, ảnh bị cắt sai")
 
             cropped = img.crop((left, top, right, bottom))
+
+            if fit_mode == "padding":
+                cropped = make_9_16_padding(cropped)
+            else:
+                cropped = make_9_16_crop(cropped)
 
             output_path = os.path.join(
                 output_dir,
@@ -171,7 +95,7 @@ def crop_grid_image(
 
             frame_index += 1
 
-    return output_files, cols, rows
+    return output_files
 
 
 def create_zip(files, zip_path):
@@ -179,37 +103,31 @@ def create_zip(files, zip_path):
         for file_path in files:
             zipf.write(file_path, arcname=os.path.basename(file_path))
 
-    return zip_path
-
 
 @app.get("/")
 def home():
     return {
         "status": "ok",
-        "message": "Grid Crop API is running"
+        "message": "Storyboard Splitter API is running",
+        "endpoint": "/crop"
     }
 
 
 @app.post("/crop")
 async def crop_image(
     file: UploadFile = File(...),
-
-    # để trống cols/rows thì API tự nhận diện
-    cols: int | None = Form(None),
-    rows: int | None = Form(None),
-
-    # nếu biết tổng số frame thì truyền vào
-    total_frames: int | None = Form(None),
-
-    # bật/tắt auto detect
-    auto_detect: bool = Form(True),
+    cols: int = Form(3),
+    rows: int = Form(4),
+    total_frames: int = Form(11),
+    crop_margin: int = Form(0),
+    fit_mode: str = Form("crop")
 ):
     job_id = str(uuid.uuid4())
 
     work_dir = f"/tmp/{job_id}"
     input_dir = os.path.join(work_dir, "input")
     output_dir = os.path.join(work_dir, "frames")
-    zip_path = os.path.join(work_dir, "frames.zip")
+    zip_path = os.path.join(work_dir, "frames_9x16.zip")
 
     os.makedirs(input_dir, exist_ok=True)
 
@@ -219,13 +137,22 @@ async def crop_image(
         with open(input_path, "wb") as f:
             f.write(await file.read())
 
-        frames, detected_cols, detected_rows = crop_grid_image(
+        fit_mode = fit_mode.lower().strip()
+
+        if fit_mode not in ["crop", "padding"]:
+            raise HTTPException(
+                status_code=400,
+                detail="fit_mode chỉ nhận crop hoặc padding"
+            )
+
+        frames = crop_grid_image(
             input_path=input_path,
             output_dir=output_dir,
             cols=cols,
             rows=rows,
             total_frames=total_frames,
-            auto_detect=auto_detect
+            crop_margin=crop_margin,
+            fit_mode=fit_mode
         )
 
         create_zip(frames, zip_path)
@@ -233,12 +160,7 @@ async def crop_image(
         return FileResponse(
             zip_path,
             media_type="application/zip",
-            filename=f"frames_{detected_cols}x{detected_rows}.zip",
-            headers={
-                "X-Detected-Cols": str(detected_cols),
-                "X-Detected-Rows": str(detected_rows),
-                "X-Total-Frames": str(len(frames)),
-            }
+            filename="frames_9x16.zip"
         )
 
     except Exception as e:
