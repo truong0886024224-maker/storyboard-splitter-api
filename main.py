@@ -17,10 +17,13 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Storyboard Splitter Exact 9x16 No AI"}
+    return {
+        "status": "ok",
+        "message": "Storyboard Splitter - Keep Full Original Panel 9x16 No AI"
+    }
 
 
-def make_grid_boxes(img, rows, cols, margin=2):
+def make_grid_boxes(img, rows, cols, margin=0):
     h, w = img.shape[:2]
     boxes = []
 
@@ -44,46 +47,68 @@ def make_grid_boxes(img, rows, cols, margin=2):
     return boxes
 
 
-def crop_to_9x16(img):
+def create_background(img, width, height, bg_mode="edge"):
     h, w = img.shape[:2]
-    target_ratio = 9 / 16
 
-    current_ratio = w / h
+    if bg_mode == "white":
+        return np.ones((height, width, 3), dtype=np.uint8) * 255
 
-    if current_ratio > target_ratio:
-        # ảnh đang quá ngang, cắt hai bên
-        new_w = int(h * target_ratio)
-        x1 = (w - new_w) // 2
-        x2 = x1 + new_w
-        y1 = 0
-        y2 = h
-    else:
-        # ảnh đang quá cao, cắt trên dưới
-        new_h = int(w / target_ratio)
-        y1 = (h - new_h) // 2
-        y2 = y1 + new_h
-        x1 = 0
-        x2 = w
+    if bg_mode == "black":
+        return np.zeros((height, width, 3), dtype=np.uint8)
 
-    return img[y1:y2, x1:x2], {
-        "x1": int(x1),
-        "y1": int(y1),
-        "x2": int(x2),
-        "y2": int(y2)
-    }
+    # bg=edge: lấy màu trung bình từ viền ảnh, không blur, không AI
+    top = img[0:max(2, h // 12), :, :]
+    bottom = img[max(0, h - h // 12):h, :, :]
+    left = img[:, 0:max(2, w // 12), :]
+    right = img[:, max(0, w - w // 12):w, :]
+
+    samples = np.concatenate([
+        top.reshape(-1, 3),
+        bottom.reshape(-1, 3),
+        left.reshape(-1, 3),
+        right.reshape(-1, 3),
+    ], axis=0)
+
+    color = np.mean(samples, axis=0).astype(np.uint8)
+
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:] = color
+
+    return canvas
 
 
-def resize_sharp(img, width=1080, height=1920):
+def make_9x16_keep_full_image(img, width=1080, height=1920, bg_mode="edge"):
+    h, w = img.shape[:2]
+
+    # Fit toàn bộ ảnh vào khung 9:16, KHÔNG crop
+    scale = min(width / w, height / h)
+
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+
     resized = cv2.resize(
         img,
-        (width, height),
+        (new_w, new_h),
         interpolation=cv2.INTER_LANCZOS4
     )
 
-    blur = cv2.GaussianBlur(resized, (0, 0), 0.8)
-    sharp = cv2.addWeighted(resized, 1.2, blur, -0.2, 0)
+    canvas = create_background(img, width, height, bg_mode)
 
-    return sharp
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
+
+    canvas[y:y + new_h, x:x + new_w] = resized
+
+    return canvas, {
+        "mode": "keep_full_original_panel_no_crop",
+        "background": bg_mode,
+        "original_width": int(w),
+        "original_height": int(h),
+        "placed_width": int(new_w),
+        "placed_height": int(new_h),
+        "x": int(x),
+        "y": int(y)
+    }
 
 
 @app.post("/split-storyboard")
@@ -93,8 +118,9 @@ async def split_storyboard(
     cols: int = Query(2),
     width: int = Query(1080),
     height: int = Query(1920),
+    margin: int = Query(0),
     quality: int = Query(96),
-    margin: int = Query(2)
+    bg: str = Query("edge")
 ):
     try:
         contents = await file.read()
@@ -102,7 +128,10 @@ async def split_storyboard(
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return JSONResponse({"error": "Cannot read image"}, status_code=400)
+            return JSONResponse(
+                {"error": "Cannot read image"},
+                status_code=400
+            )
 
         boxes = make_grid_boxes(img, rows, cols, margin)
 
@@ -110,17 +139,24 @@ async def split_storyboard(
         scenes = []
 
         for i, box in enumerate(boxes, start=1):
-            x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+            x1 = box["x1"]
+            y1 = box["y1"]
+            x2 = box["x2"]
+            y2 = box["y2"]
 
             panel = img[y1:y2, x1:x2]
 
             if panel.size == 0:
                 continue
 
-            crop_9x16, crop_box = crop_to_9x16(panel)
-            final_img = resize_sharp(crop_9x16, width, height)
+            final_img, debug = make_9x16_keep_full_image(
+                panel,
+                width=width,
+                height=height,
+                bg_mode=bg
+            )
 
-            filename = f"{batch_id}_scene_{i:03}_9x16.jpg"
+            filename = f"{batch_id}_scene_{i:03}_9x16_keep_full.jpg"
             path = os.path.join(OUTPUT_DIR, filename)
 
             cv2.imwrite(
@@ -142,7 +178,7 @@ async def split_storyboard(
                     "cols": int(cols)
                 },
                 "storyboard_box": box,
-                "crop_9x16_box_inside_panel": crop_box
+                "resize": debug
             })
 
         return {
@@ -153,12 +189,16 @@ async def split_storyboard(
             "height": int(height),
             "ratio": "9:16",
             "ai": "disabled",
-            "mode": "exact_crop_from_storyboard",
+            "mode": "keep_full_original_panel_no_crop",
+            "background": bg,
             "scenes": scenes
         }
 
     except Exception as e:
         return JSONResponse(
-            {"error": "Internal Server Error", "detail": str(e)},
+            {
+                "error": "Internal Server Error",
+                "detail": str(e)
+            },
             status_code=500
         )
