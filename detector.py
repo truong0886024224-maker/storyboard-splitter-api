@@ -91,7 +91,7 @@ def detect_panels(img):
     boxes = []
 
     image_area = W * H
-    min_area = image_area * 0.01
+    min_area = image_area * 0.003
     max_area = image_area * 0.95
 
     for cnt in contours:
