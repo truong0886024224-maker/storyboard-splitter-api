@@ -1,0 +1,10 @@
+OUTPUT_DIR = "files"
+BASE_URL = "https://storyboard-splitter-api.onrender.com"
+
+DEFAULT_WIDTH = 1080
+DEFAULT_HEIGHT = 1920
+DEFAULT_QUALITY = 96
+DEFAULT_BACKGROUND = "black"
+
+MIN_PANEL_AREA_RATIO = 0.01
+MAX_PANEL_AREA_RATIO = 0.95
