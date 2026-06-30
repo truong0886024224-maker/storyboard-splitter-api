@@ -68,11 +68,11 @@ def detect_panels(img):
 
     # Tách vùng không phải nền trắng
     _, binary = cv2.threshold(
-        gray,
-        245,
-        255,
-        cv2.THRESH_BINARY_INV
-    )
+    gray,
+    235,
+    255,
+    cv2.THRESH_BINARY_INV
+)
 
     # Làm kín vùng panel
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
